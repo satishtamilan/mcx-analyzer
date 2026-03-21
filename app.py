@@ -268,6 +268,119 @@ def check_signal(df, adx_period=14):
     }
 
 # ─────────────────────────────────────────────────────────────
+# BACKTESTER
+# ─────────────────────────────────────────────────────────────
+
+def backtest_strategy(df, adx_period=14, st_period=10, st_mult=3.0,
+                      min_score=5, atr_sl_mult=1.5):
+    """Walk bar-by-bar, enter when score >= min_score, exit at SL/T1/T2/T3."""
+    adx, pdi, mdi = calc_adx(df, adx_period)
+    stl, dr       = calc_supertrend(df, st_period, st_mult)
+    rsi           = calc_rsi(df["close"], 14)
+    vwap          = calc_vwap(df)
+    atr           = calc_atr(df["high"], df["low"], df["close"], 14)
+
+    vol_avg = df["volume"].rolling(20).mean()
+
+    trades  = []
+    in_trade = None
+    lookback = max(adx_period, 20) + 2
+
+    for i in range(lookback, len(df)):
+        h_slice = df.iloc[:i+1]
+        price   = df["close"].iloc[i]
+        bar_dt  = df.index[i]
+
+        if in_trade is not None:
+            hi = df["high"].iloc[i]
+            lo = df["low"].iloc[i]
+
+            if in_trade["side"] == "BUY":
+                if lo <= in_trade["stop"]:
+                    in_trade["exit_price"] = in_trade["stop"]
+                    in_trade["exit_time"]  = bar_dt
+                    in_trade["result"]     = "SL Hit"
+                    in_trade["pnl"]        = in_trade["stop"] - in_trade["entry"]
+                    trades.append(in_trade); in_trade = None; continue
+                if hi >= in_trade["t3"]:
+                    in_trade["exit_price"] = in_trade["t3"]
+                    in_trade["exit_time"]  = bar_dt
+                    in_trade["result"]     = "T3 Hit"
+                    in_trade["pnl"]        = in_trade["t3"] - in_trade["entry"]
+                    trades.append(in_trade); in_trade = None; continue
+                if hi >= in_trade["t2"] and in_trade.get("best", "") != "T2+":
+                    in_trade["best"] = "T2+"
+                if hi >= in_trade["t1"] and in_trade.get("best", "") == "":
+                    in_trade["best"] = "T1+"
+                    in_trade["stop"] = in_trade["entry"]
+            else:
+                if hi >= in_trade["stop"]:
+                    in_trade["exit_price"] = in_trade["stop"]
+                    in_trade["exit_time"]  = bar_dt
+                    in_trade["result"]     = "SL Hit"
+                    in_trade["pnl"]        = in_trade["entry"] - in_trade["stop"]
+                    trades.append(in_trade); in_trade = None; continue
+                if lo <= in_trade["t3"]:
+                    in_trade["exit_price"] = in_trade["t3"]
+                    in_trade["exit_time"]  = bar_dt
+                    in_trade["result"]     = "T3 Hit"
+                    in_trade["pnl"]        = in_trade["entry"] - in_trade["t3"]
+                    trades.append(in_trade); in_trade = None; continue
+                if lo <= in_trade["t2"] and in_trade.get("best", "") != "T2+":
+                    in_trade["best"] = "T2+"
+                if lo <= in_trade["t1"] and in_trade.get("best", "") == "":
+                    in_trade["best"] = "T1+"
+                    in_trade["stop"] = in_trade["entry"]
+            continue
+
+        if i < lookback + 1:
+            continue
+
+        pp_h  = df["high"].iloc[i-1]; pp_l = df["low"].iloc[i-1]; pp_c = df["close"].iloc[i-1]
+        pp    = (pp_h + pp_l + pp_c) / 3
+
+        di_bull = pdi.iloc[i] > mdi.iloc[i]
+        di_bear = mdi.iloc[i] > pdi.iloc[i]
+        rsi_ok  = 30 <= rsi.iloc[i] <= 70
+        vol_sp  = df["volume"].iloc[i] > (vol_avg.iloc[i] * 1.5) if pd.notna(vol_avg.iloc[i]) and vol_avg.iloc[i] > 0 else False
+        adx_ok  = adx.iloc[i] > ADX_STRONG
+        atr_v   = atr.iloc[i]
+
+        buy_score = sum([di_bull, adx_ok, price > vwap.iloc[i],
+                         dr.iloc[i] == -1, price > pp, rsi_ok, vol_sp])
+        sell_score = sum([di_bear, adx_ok, price < vwap.iloc[i],
+                          dr.iloc[i] == 1, price < pp, rsi_ok, vol_sp])
+
+        if buy_score >= min_score:
+            in_trade = {
+                "side": "BUY", "entry_time": bar_dt, "entry": price,
+                "stop": price - atr_sl_mult * atr_v,
+                "t1": price + atr_sl_mult * atr_v,
+                "t2": price + 2 * atr_sl_mult * atr_v,
+                "t3": price + 3 * atr_sl_mult * atr_v,
+                "score": buy_score, "best": "",
+            }
+        elif sell_score >= min_score:
+            in_trade = {
+                "side": "SELL", "entry_time": bar_dt, "entry": price,
+                "stop": price + atr_sl_mult * atr_v,
+                "t1": price - atr_sl_mult * atr_v,
+                "t2": price - 2 * atr_sl_mult * atr_v,
+                "t3": price - 3 * atr_sl_mult * atr_v,
+                "score": sell_score, "best": "",
+            }
+
+    if in_trade is not None:
+        last_price = df["close"].iloc[-1]
+        pnl = (last_price - in_trade["entry"]) if in_trade["side"] == "BUY" else (in_trade["entry"] - last_price)
+        in_trade.update({"exit_price": last_price, "exit_time": df.index[-1],
+                         "result": "Open", "pnl": pnl})
+        trades.append(in_trade)
+
+    return trades
+
+
+# ─────────────────────────────────────────────────────────────
 # ANGEL ONE API
 # ─────────────────────────────────────────────────────────────
 
@@ -659,7 +772,8 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 
 st.markdown("## 📊 MCX & Crypto Analyzer")
-tab1, tab2, tab3 = st.tabs(["📈  MCX Chart", "🔔  MCX BUY / SELL Alert", "₿  Crypto (BTC / ETH)"])
+tab1, tab2, tab3, tab4 = st.tabs(["📈  MCX Chart", "🔔  MCX BUY / SELL Alert",
+                                  "₿  Crypto Strategy", "📊  Backtest & Track"])
 
 # Guard flag — MCX tabs need login
 mcx_ready = "jwt" in st.session_state
@@ -1295,4 +1409,198 @@ with tab3:
         | ETH/USDT | Ethereum — DeFi leader |
         | SOL/USDT | Solana |
         | BNB/USDT | Binance Coin |
+        """)
+
+# ───────────────────── TAB 4 — BACKTEST & TRACK ──────────
+with tab4:
+    st.markdown("## 📊 Strategy Backtester — Signal Performance Tracker")
+    st.caption("Run the 7-condition strategy on historical data to see real win rate, P&L, and every trade")
+
+    bt_c1, bt_c2, bt_c3, bt_c4 = st.columns([2, 1, 1, 1])
+    with bt_c1:
+        bt_sym = st.selectbox("Coin", list(CRYPTO_SYMBOLS.keys()), key="bt_sym")
+    with bt_c2:
+        bt_tf = st.selectbox("Timeframe", list(BINANCE_INTERVALS.keys()),
+                             index=1, key="bt_tf")
+    with bt_c3:
+        bt_min = st.slider("Min Score", 4, 7, 5, key="bt_min",
+                           help="Conditions needed to trigger entry")
+    with bt_c4:
+        bt_atr = st.slider("SL Multiplier", 1.0, 3.0, 1.5, 0.5, key="bt_atr",
+                           help="ATR multiplier for stop-loss distance")
+
+    if st.button("🚀 Run Backtest", type="primary", key="run_bt"):
+        binance_sym          = CRYPTO_SYMBOLS[bt_sym]
+        interval_code, limit = BINANCE_INTERVALS[bt_tf]
+
+        with st.spinner(f"Fetching {bt_sym} data & running backtest…"):
+            try:
+                df_bt = fetch_crypto_candles(binance_sym, interval_code, limit)
+                trades = backtest_strategy(df_bt, min_score=bt_min,
+                                           atr_sl_mult=bt_atr)
+
+                if not trades:
+                    st.warning("No trades generated in this period. "
+                               "Try lowering the min score or changing the timeframe.")
+                else:
+                    tdf = pd.DataFrame(trades)
+
+                    wins   = tdf[tdf["pnl"] > 0]
+                    losses = tdf[tdf["pnl"] <= 0]
+                    total  = len(tdf)
+                    w      = len(wins)
+                    l      = len(losses)
+                    wr     = (w / total * 100) if total > 0 else 0
+                    total_pnl  = tdf["pnl"].sum()
+                    avg_win    = wins["pnl"].mean() if len(wins) > 0 else 0
+                    avg_loss   = losses["pnl"].mean() if len(losses) > 0 else 0
+                    best_trade = tdf["pnl"].max()
+                    worst_trade = tdf["pnl"].min()
+                    t3_hits = len(tdf[tdf["result"] == "T3 Hit"])
+                    sl_hits = len(tdf[tdf["result"] == "SL Hit"])
+                    open_trades = len(tdf[tdf["result"] == "Open"])
+                    profit_factor = abs(wins["pnl"].sum() / losses["pnl"].sum()) if len(losses) > 0 and losses["pnl"].sum() != 0 else float("inf")
+
+                    # ── Stats cards ────────────────────────
+                    st.subheader("📈 Performance Summary")
+                    k1, k2, k3, k4, k5, k6 = st.columns(6)
+                    k1.metric("Total Trades", total)
+                    k2.metric("Win Rate", f"{wr:.1f}%",
+                              f"{w}W / {l}L")
+                    k3.metric("Total P&L", f"${total_pnl:,.2f}",
+                              "Profit ✅" if total_pnl > 0 else "Loss ❌")
+                    k4.metric("Avg Win", f"${avg_win:,.2f}")
+                    k5.metric("Avg Loss", f"${avg_loss:,.2f}")
+                    k6.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞")
+
+                    k7, k8, k9, k10 = st.columns(4)
+                    k7.metric("Best Trade", f"${best_trade:,.2f}")
+                    k8.metric("Worst Trade", f"${worst_trade:,.2f}")
+                    k9.metric("T3 Hits 🎯", t3_hits)
+                    k10.metric("SL Hits 🛑", sl_hits)
+
+                    # ── Equity curve ───────────────────────
+                    st.subheader("💰 Equity Curve")
+                    equity = tdf["pnl"].cumsum()
+                    fig_eq = go.Figure()
+                    colors = ["#00e676" if v >= 0 else "#ff5252" for v in equity]
+                    fig_eq.add_trace(go.Scatter(
+                        x=list(range(1, len(equity)+1)), y=equity,
+                        mode="lines+markers",
+                        line=dict(color="#00e676", width=2.5),
+                        marker=dict(size=8, color=colors,
+                                    line=dict(width=1, color="#0e1117")),
+                        fill="tozeroy",
+                        fillcolor="rgba(0,230,118,0.1)",
+                        name="Cumulative P&L",
+                    ))
+                    fig_eq.add_hline(y=0, line_dash="dash", line_color="#555")
+                    max_eq = equity.max()
+                    drawdown = equity - equity.cummax()
+                    fig_eq.add_trace(go.Scatter(
+                        x=list(range(1, len(drawdown)+1)), y=drawdown,
+                        mode="lines", name="Drawdown",
+                        line=dict(color="#ff5252", width=1.5, dash="dot"),
+                        fill="tozeroy", fillcolor="rgba(255,82,82,0.08)",
+                    ))
+                    fig_eq.update_layout(
+                        height=350, template="plotly_dark",
+                        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                        xaxis_title="Trade #", yaxis_title="Cumulative P&L ($)",
+                        legend=dict(orientation="h", y=1.1),
+                        margin=dict(l=10, r=10, t=10, b=40),
+                    )
+                    st.plotly_chart(fig_eq, use_container_width=True)
+
+                    # ── Win/Loss breakdown chart ───────────
+                    st.subheader("📊 Trade Results Breakdown")
+                    res_c1, res_c2 = st.columns(2)
+
+                    with res_c1:
+                        result_counts = tdf["result"].value_counts()
+                        fig_pie = go.Figure(go.Pie(
+                            labels=result_counts.index,
+                            values=result_counts.values,
+                            marker=dict(colors=["#00e676", "#ff5252", "#ffd700", "#888"]),
+                            hole=0.45,
+                            textinfo="label+value",
+                        ))
+                        fig_pie.update_layout(
+                            height=300, template="plotly_dark",
+                            paper_bgcolor="#0e1117",
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            title="Exit Reasons",
+                        )
+                        st.plotly_chart(fig_pie, use_container_width=True)
+
+                    with res_c2:
+                        side_counts = tdf["side"].value_counts()
+                        fig_bar = go.Figure(go.Bar(
+                            x=side_counts.index, y=side_counts.values,
+                            marker_color=["#00e676" if s == "BUY" else "#ff5252"
+                                          for s in side_counts.index],
+                        ))
+                        buy_pnl = tdf[tdf["side"]=="BUY"]["pnl"].sum()
+                        sell_pnl = tdf[tdf["side"]=="SELL"]["pnl"].sum()
+                        fig_bar.update_layout(
+                            height=300, template="plotly_dark",
+                            paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                            title=f"BUY P&L: ${buy_pnl:,.2f}  |  SELL P&L: ${sell_pnl:,.2f}",
+                            margin=dict(l=10, r=10, t=40, b=10),
+                            yaxis_title="Count",
+                        )
+                        st.plotly_chart(fig_bar, use_container_width=True)
+
+                    # ── Trade log ──────────────────────────
+                    st.subheader("📋 Trade Log")
+                    display_df = tdf[["side", "entry_time", "entry", "stop",
+                                      "t1", "t3", "exit_time", "exit_price",
+                                      "result", "pnl", "score"]].copy()
+                    display_df["entry_time"] = pd.to_datetime(display_df["entry_time"]).dt.strftime("%m/%d %H:%M")
+                    display_df["exit_time"]  = pd.to_datetime(display_df["exit_time"]).dt.strftime("%m/%d %H:%M")
+                    for col in ["entry","stop","t1","t3","exit_price","pnl"]:
+                        display_df[col] = display_df[col].apply(lambda x: f"${x:,.2f}")
+                    display_df.columns = ["Side","Entry Time","Entry","Stop",
+                                          "T1","T3","Exit Time","Exit Price",
+                                          "Result","P&L","Score"]
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                    # ── Download CSV ───────────────────────
+                    csv = tdf.to_csv(index=False)
+                    st.download_button("📥 Download Trade Log (CSV)", csv,
+                                       f"backtest_{bt_sym}_{bt_tf}.csv",
+                                       "text/csv", use_container_width=True)
+
+                    st.caption(f"🕒 Backtest ran on {len(df_bt)} candles  |  "
+                               f"Period: {df_bt.index[0].strftime('%Y-%m-%d')} → "
+                               f"{df_bt.index[-1].strftime('%Y-%m-%d')}  |  "
+                               f"Min score: {bt_min}/7  |  SL: {bt_atr}× ATR")
+
+            except Exception as ex:
+                st.error(f"❌ Backtest error: {ex}")
+
+    else:
+        st.info("👆 Select a coin and settings, then click **Run Backtest** to see historical performance")
+        st.markdown("""
+        ### How it works
+
+        The backtester **replays your 7-condition strategy** bar-by-bar on historical data:
+
+        1. Scans each candle for entry conditions (same 7 conditions as live strategy)
+        2. When score ≥ threshold → enters a trade
+        3. Tracks the trade: did price hit **T1, T2, T3** (profit) or **Stop Loss** first?
+        4. After T1 hit → stop-loss moves to breakeven (no-loss protection)
+        5. Calculates win rate, total P&L, profit factor, and equity curve
+
+        ### What to look for
+        - **Win Rate > 50%** with good profit factor → strategy is working
+        - **T3 hits > SL hits** → strategy catches big moves
+        - **Smooth equity curve** → consistent, not just lucky
+        - **Max drawdown** → how much pain before recovery
+        - Try different **min scores** (4 vs 5 vs 6) to see the tradeoff between frequency and quality
+
+        ### Tips
+        - **15 min + Score 5** → more trades, good for testing
+        - **1 hour + Score 5** → fewer but higher-quality signals
+        - **Score 6-7** → very selective, may have few trades but high win rate
         """)
