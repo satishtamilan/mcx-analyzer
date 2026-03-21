@@ -1,0 +1,20 @@
+services:
+  # Streamlit dashboard (web UI)
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+  # Background alert scanner — runs every 15 min
+  scanner:
+    build: .
+    entrypoint: ["python", "scanner.py", "--loop", "--interval", "900"]
+    environment:
+      - SENDER_EMAIL=${SENDER_EMAIL}
+      - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD}
+      - RECIPIENT_EMAIL=${RECIPIENT_EMAIL}
+      - COINS=${COINS:-BTCUSDT,ETHUSDT}
+      - TIMEFRAME=${TIMEFRAME:-15m}
+      - MIN_SCORE=${MIN_SCORE:-5}
+    restart: unless-stopped
