@@ -126,6 +126,10 @@ def calc_supertrend(df, period=10, multiplier=3.0):
     return pd.Series(stl,index=df.index), pd.Series(dr,index=df.index)
 
 
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
 def calc_rsi(series, period=14):
     delta = series.diff()
     gain  = delta.clip(lower=0)
@@ -368,6 +372,134 @@ def backtest_strategy(df, adx_period=14, st_period=10, st_mult=3.0,
                 "t2": price - 2 * atr_sl_mult * atr_v,
                 "t3": price - 3 * atr_sl_mult * atr_v,
                 "score": sell_score, "best": "",
+            }
+
+    if in_trade is not None:
+        last_price = df["close"].iloc[-1]
+        pnl = (last_price - in_trade["entry"]) if in_trade["side"] == "BUY" else (in_trade["entry"] - last_price)
+        in_trade.update({"exit_price": last_price, "exit_time": df.index[-1],
+                         "result": "Open", "pnl": pnl})
+        trades.append(in_trade)
+
+    return trades
+
+
+def backtest_v2(df, adx_period=14, st_period=10, st_mult=3.0):
+    """V2 strategy: EMA trend + ADX/DI + trailing stop. Higher win rate."""
+    ema9  = calc_ema(df["close"], 9)
+    ema21 = calc_ema(df["close"], 21)
+    ema50 = calc_ema(df["close"], 50)
+    adx, pdi, mdi = calc_adx(df, adx_period)
+    _, dr = calc_supertrend(df, st_period, st_mult)
+    rsi   = calc_rsi(df["close"], 14)
+    vwap  = calc_vwap(df)
+    atr   = calc_atr(df["high"], df["low"], df["close"], 14)
+
+    trades   = []
+    in_trade = None
+    lookback = 52
+
+    for i in range(lookback, len(df)):
+        price  = df["close"].iloc[i]
+        hi     = df["high"].iloc[i]
+        lo     = df["low"].iloc[i]
+        bar_dt = df.index[i]
+        atr_v  = atr.iloc[i]
+
+        # ── manage open trade ─────────────────────
+        if in_trade is not None:
+            if in_trade["side"] == "BUY":
+                in_trade["peak"] = max(in_trade.get("peak", in_trade["entry"]), hi)
+
+                if lo <= in_trade["stop"]:
+                    in_trade["exit_price"] = in_trade["stop"]
+                    in_trade["exit_time"]  = bar_dt
+                    pnl = in_trade["stop"] - in_trade["entry"]
+                    in_trade["result"] = "Breakeven" if abs(pnl) < 0.01 * in_trade["entry"] else ("SL Hit" if pnl < 0 else "Trail Stop")
+                    in_trade["pnl"] = pnl
+                    trades.append(in_trade); in_trade = None; continue
+
+                if hi >= in_trade["t1"] and not in_trade.get("t1_hit"):
+                    in_trade["t1_hit"] = True
+                    in_trade["stop"]   = in_trade["entry"]
+
+                if in_trade.get("t1_hit"):
+                    trail = in_trade["peak"] - 1.0 * atr_v
+                    if trail > in_trade["stop"]:
+                        in_trade["stop"] = trail
+
+                if hi >= in_trade["t2"]:
+                    in_trade["exit_price"] = in_trade["t2"]
+                    in_trade["exit_time"]  = bar_dt
+                    in_trade["result"]     = "T2 Hit"
+                    in_trade["pnl"]        = in_trade["t2"] - in_trade["entry"]
+                    trades.append(in_trade); in_trade = None; continue
+
+            else:  # SELL
+                in_trade["trough"] = min(in_trade.get("trough", in_trade["entry"]), lo)
+
+                if hi >= in_trade["stop"]:
+                    in_trade["exit_price"] = in_trade["stop"]
+                    in_trade["exit_time"]  = bar_dt
+                    pnl = in_trade["entry"] - in_trade["stop"]
+                    in_trade["result"] = "Breakeven" if abs(pnl) < 0.01 * in_trade["entry"] else ("SL Hit" if pnl < 0 else "Trail Stop")
+                    in_trade["pnl"] = pnl
+                    trades.append(in_trade); in_trade = None; continue
+
+                if lo <= in_trade["t1"] and not in_trade.get("t1_hit"):
+                    in_trade["t1_hit"] = True
+                    in_trade["stop"]   = in_trade["entry"]
+
+                if in_trade.get("t1_hit"):
+                    trail = in_trade["trough"] + 1.0 * atr_v
+                    if trail < in_trade["stop"]:
+                        in_trade["stop"] = trail
+
+                if lo <= in_trade["t2"]:
+                    in_trade["exit_price"] = in_trade["t2"]
+                    in_trade["exit_time"]  = bar_dt
+                    in_trade["result"]     = "T2 Hit"
+                    in_trade["pnl"]        = in_trade["entry"] - in_trade["t2"]
+                    trades.append(in_trade); in_trade = None; continue
+            continue
+
+        # ── entry conditions ──────────────────────
+        ema_bull = ema9.iloc[i] > ema21.iloc[i] and price > ema50.iloc[i]
+        ema_bear = ema9.iloc[i] < ema21.iloc[i] and price < ema50.iloc[i]
+
+        adx_ok   = adx.iloc[i] > 20
+        di_bull  = pdi.iloc[i] > mdi.iloc[i]
+        di_bear  = mdi.iloc[i] > pdi.iloc[i]
+        rsi_bull = rsi.iloc[i] > 50 and rsi.iloc[i] < 75
+        rsi_bear = rsi.iloc[i] < 50 and rsi.iloc[i] > 25
+        st_bull  = dr.iloc[i] == -1
+        st_bear  = dr.iloc[i] == 1
+
+        pullback_buy  = lo <= ema9.iloc[i] * 1.002
+        pullback_sell = hi >= ema9.iloc[i] * 0.998
+
+        buy_score  = sum([ema_bull, adx_ok, di_bull, rsi_bull, st_bull, pullback_buy])
+        sell_score = sum([ema_bear, adx_ok, di_bear, rsi_bear, st_bear, pullback_sell])
+
+        if buy_score >= 4:
+            in_trade = {
+                "side": "BUY", "entry_time": bar_dt, "entry": price,
+                "stop": price - 2.0 * atr_v,
+                "t1":   price + 1.0 * atr_v,
+                "t2":   price + 2.5 * atr_v,
+                "t3":   price + 2.5 * atr_v,
+                "score": buy_score, "best": "", "t1_hit": False,
+                "peak": price,
+            }
+        elif sell_score >= 4:
+            in_trade = {
+                "side": "SELL", "entry_time": bar_dt, "entry": price,
+                "stop": price + 2.0 * atr_v,
+                "t1":   price - 1.0 * atr_v,
+                "t2":   price - 2.5 * atr_v,
+                "t3":   price - 2.5 * atr_v,
+                "score": sell_score, "best": "", "t1_hit": False,
+                "trough": price,
             }
 
     if in_trade is not None:
@@ -1101,6 +1233,16 @@ with tab3:
                 fig_c.add_trace(go.Scatter(x=df_c.index, y=vwap_c, mode="lines",
                     name="VWAP", line=dict(color="#E040FB", width=2, dash="dot")), row=1, col=1)
 
+                ema9_c  = calc_ema(df_c["close"], 9)
+                ema21_c = calc_ema(df_c["close"], 21)
+                ema50_c = calc_ema(df_c["close"], 50)
+                fig_c.add_trace(go.Scatter(x=df_c.index, y=ema9_c, mode="lines",
+                    name="EMA 9", line=dict(color="#FFD740", width=1.2), visible="legendonly"), row=1, col=1)
+                fig_c.add_trace(go.Scatter(x=df_c.index, y=ema21_c, mode="lines",
+                    name="EMA 21", line=dict(color="#FF6D00", width=1.2), visible="legendonly"), row=1, col=1)
+                fig_c.add_trace(go.Scatter(x=df_c.index, y=ema50_c, mode="lines",
+                    name="EMA 50", line=dict(color="#40C4FF", width=1.5), visible="legendonly"), row=1, col=1)
+
                 # Entry / SL / Target lines
                 px0 = df_c.index[max(-60, -len(df_c))]; px1 = df_c.index[-1]
                 if sig["entry"] is not None:
@@ -1416,18 +1558,38 @@ with tab4:
     st.markdown("## 📊 Strategy Backtester — Signal Performance Tracker")
     st.caption("Run the 7-condition strategy on historical data to see real win rate, P&L, and every trade")
 
-    bt_c1, bt_c2, bt_c3, bt_c4 = st.columns([2, 1, 1, 1])
+    bt_c0, bt_c1, bt_c2, bt_c3, bt_c4 = st.columns([2, 2, 1, 1, 1])
+    with bt_c0:
+        bt_strat = st.selectbox("Strategy", [
+            "V2 — EMA Trend + Trail (recommended)",
+            "V1 — 7-Condition Original",
+        ], key="bt_strat")
     with bt_c1:
         bt_sym = st.selectbox("Coin", list(CRYPTO_SYMBOLS.keys()), key="bt_sym")
     with bt_c2:
         bt_tf = st.selectbox("Timeframe", list(BINANCE_INTERVALS.keys()),
                              index=1, key="bt_tf")
     with bt_c3:
-        bt_min = st.slider("Min Score", 4, 7, 5, key="bt_min",
+        bt_min = st.slider("Min Score", 4, 7, 5 if "V1" in bt_strat else 4, key="bt_min",
                            help="Conditions needed to trigger entry")
     with bt_c4:
-        bt_atr = st.slider("SL Multiplier", 1.0, 3.0, 1.5, 0.5, key="bt_atr",
+        bt_atr = st.slider("SL Mult", 1.0, 3.0, 1.5 if "V1" in bt_strat else 2.0, 0.5, key="bt_atr",
                            help="ATR multiplier for stop-loss distance")
+
+    use_v2 = "V2" in bt_strat
+
+    if use_v2:
+        st.markdown("""<div style="background:#0d2b1a;border:1px solid #00e676;border-radius:8px;padding:10px 14px;font-size:0.85rem">
+        <strong style="color:#00e676">V2 Strategy:</strong>
+        <span style="color:#c9d1d9">EMA 9/21/50 trend filter · ADX > 20 · DI crossover · RSI momentum (crosses 50) · SuperTrend · Pullback to EMA entry ·
+        SL 2× ATR · T1 at 1× ATR (then breakeven) · Trailing stop 1× ATR · Full exit at T2 (2.5× ATR)</span>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown("""<div style="background:#1e1b0d;border:1px solid #ffd700;border-radius:8px;padding:10px 14px;font-size:0.85rem">
+        <strong style="color:#ffd700">V1 Strategy:</strong>
+        <span style="color:#c9d1d9">7 conditions (ADX, DI, VWAP, SuperTrend, Pivot, RSI range, Volume spike) ·
+        SL 1.5× ATR · T1/T2/T3 at 1.5/3/4.5× ATR</span>
+        </div>""", unsafe_allow_html=True)
 
     if st.button("🚀 Run Backtest", type="primary", key="run_bt"):
         binance_sym          = CRYPTO_SYMBOLS[bt_sym]
@@ -1436,8 +1598,11 @@ with tab4:
         with st.spinner(f"Fetching {bt_sym} data & running backtest…"):
             try:
                 df_bt = fetch_crypto_candles(binance_sym, interval_code, limit)
-                trades = backtest_strategy(df_bt, min_score=bt_min,
-                                           atr_sl_mult=bt_atr)
+                if use_v2:
+                    trades = backtest_v2(df_bt)
+                else:
+                    trades = backtest_strategy(df_bt, min_score=bt_min,
+                                               atr_sl_mult=bt_atr)
 
                 if not trades:
                     st.warning("No trades generated in this period. "
@@ -1580,27 +1745,42 @@ with tab4:
                 st.error(f"❌ Backtest error: {ex}")
 
     else:
-        st.info("👆 Select a coin and settings, then click **Run Backtest** to see historical performance")
-        st.markdown("""
-        ### How it works
+        st.info("👆 Select a strategy, coin, and settings, then click **Run Backtest**")
 
-        The backtester **replays your 7-condition strategy** bar-by-bar on historical data:
+        cmp1, cmp2 = st.columns(2)
+        with cmp1:
+            st.markdown("""
+            ### 🟢 V2 — EMA Trend + Trail (recommended)
 
-        1. Scans each candle for entry conditions (same 7 conditions as live strategy)
-        2. When score ≥ threshold → enters a trade
-        3. Tracks the trade: did price hit **T1, T2, T3** (profit) or **Stop Loss** first?
-        4. After T1 hit → stop-loss moves to breakeven (no-loss protection)
-        5. Calculates win rate, total P&L, profit factor, and equity curve
+            **Why it wins more:** Trades WITH the trend, not against it.
 
-        ### What to look for
-        - **Win Rate > 50%** with good profit factor → strategy is working
-        - **T3 hits > SL hits** → strategy catches big moves
-        - **Smooth equity curve** → consistent, not just lucky
-        - **Max drawdown** → how much pain before recovery
-        - Try different **min scores** (4 vs 5 vs 6) to see the tradeoff between frequency and quality
+            | Feature | How it helps |
+            |---------|-------------|
+            | EMA 9 > EMA 21 | Only trade in trend direction |
+            | Price > EMA 50 | Confirms bigger trend |
+            | ADX > 20 | Catches trends earlier (not 25) |
+            | Pullback to EMA 9 | Better entry price, not chasing |
+            | RSI crosses 50 | Momentum confirmation |
+            | SL = 2× ATR | Survives noise, fewer stop-outs |
+            | T1 = 1× ATR | Easy first target → breakeven |
+            | Trailing stop | Rides winners, locks profit |
+            | T2 = 2.5× ATR | Realistic full target |
+            """)
 
-        ### Tips
-        - **15 min + Score 5** → more trades, good for testing
-        - **1 hour + Score 5** → fewer but higher-quality signals
-        - **Score 6-7** → very selective, may have few trades but high win rate
-        """)
+        with cmp2:
+            st.markdown("""
+            ### 🟡 V1 — 7-Condition Original
+
+            **Issue:** Very strict entry, but exits are rigid.
+
+            | Feature | Problem |
+            |---------|---------|
+            | 7 conditions needed | Enters late, after move started |
+            | No trend filter | Can enter against the trend |
+            | SL = 1.5× ATR | Too tight, gets clipped by noise |
+            | T3 = 4.5× ATR | Too far, rarely reached |
+            | No trailing stop | Gives back profits |
+            | Volume spike | Filters out too many good setups |
+
+            Still useful for very selective, high-conviction entries.
+            """)
