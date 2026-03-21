@@ -100,9 +100,11 @@ def calc_pivots(df):
             "R2": pp+(h-l), "S2": pp-(h-l),
             "R3": h+2*(pp-l), "S3": l-2*(h-pp)}
 
-# ── Binance fetch ─────────────────────────────────────────
+# ── Crypto fetch (Binance → Bybit fallback) ──────────────
 
-def fetch_candles(symbol, interval="15m", limit=500):
+BYBIT_INTERVAL_MAP = {"5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+
+def _fetch_binance(symbol, interval, limit):
     r = requests.get(f"{BINANCE_BASE}/api/v3/klines",
                      params={"symbol": symbol, "interval": interval, "limit": limit},
                      timeout=15)
@@ -113,6 +115,32 @@ def fetch_candles(symbol, interval="15m", limit=500):
     df["datetime"] = pd.to_datetime(df["datetime"], unit="ms")
     df = df.set_index("datetime")[["open","high","low","close","volume"]]
     return df.astype(float).sort_index()
+
+def _fetch_bybit(symbol, interval, limit):
+    bybit_iv = BYBIT_INTERVAL_MAP.get(interval, "15")
+    r = requests.get("https://api.bybit.com/v5/market/kline",
+                     params={"category": "spot", "symbol": symbol,
+                             "interval": bybit_iv, "limit": limit},
+                     timeout=15)
+    r.raise_for_status()
+    rows = r.json().get("result", {}).get("list", [])
+    if not rows:
+        raise Exception("No data from Bybit")
+    df = pd.DataFrame(rows, columns=[
+        "datetime", "open", "high", "low", "close", "volume", "turnover"])
+    df["datetime"] = pd.to_datetime(df["datetime"].astype(int), unit="ms")
+    df = df.set_index("datetime")[["open","high","low","close","volume"]]
+    return df.astype(float).sort_index()
+
+def fetch_candles(symbol, interval="15m", limit=500):
+    """Try Binance first; fall back to Bybit if geo-blocked (HTTP 451/403)."""
+    try:
+        return _fetch_binance(symbol, interval, limit)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (451, 403):
+            log.info(f"  Binance blocked (HTTP {e.response.status_code}), using Bybit…")
+            return _fetch_bybit(symbol, interval, limit)
+        raise
 
 # ── Enhanced signal ───────────────────────────────────────
 

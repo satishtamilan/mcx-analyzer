@@ -316,17 +316,15 @@ def fetch_candles(api_key, jwt, exchange, token, interval, days_back):
     raise Exception(d.get("message","No candle data"))
 
 # ─────────────────────────────────────────────────────────────
-# BINANCE API  (no key required)
+# CRYPTO API  (Binance → Bybit fallback, no key required)
 # ─────────────────────────────────────────────────────────────
-
-BINANCE_BASE = "https://api.binance.com"
 
 CRYPTO_SYMBOLS = {
     "BTC/USDT":  "BTCUSDT",
     "ETH/USDT":  "ETHUSDT",
     "BNB/USDT":  "BNBUSDT",
     "SOL/USDT":  "SOLUSDT",
-    "PAXG/USDT": "PAXGUSDT",   # tokenised gold — tracks MCX Gold
+    "PAXG/USDT": "PAXGUSDT",
 }
 
 BINANCE_INTERVALS = {
@@ -336,29 +334,79 @@ BINANCE_INTERVALS = {
     "1 day":  ("1d",  365),
 }
 
-def fetch_binance_candles(symbol, interval, limit=500):
-    """Fetch OHLCV from Binance — completely free, no API key."""
-    r = requests.get(
-        f"{BINANCE_BASE}/api/v3/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        timeout=15,
-    )
+BYBIT_INTERVAL_MAP = {
+    "5m": "5", "15m": "15", "1h": "60", "1d": "D",
+}
+
+
+def _fetch_binance(symbol, interval, limit):
+    r = requests.get("https://api.binance.com/api/v3/klines",
+                     params={"symbol": symbol, "interval": interval, "limit": limit},
+                     timeout=15)
     r.raise_for_status()
     raw = r.json()
-    df  = pd.DataFrame(raw, columns=[
+    df = pd.DataFrame(raw, columns=[
         "datetime","open","high","low","close","volume",
-        "close_time","qav","num_trades","tbbav","tbqav","ignore"
-    ])
+        "close_time","qav","num_trades","tbbav","tbqav","ignore"])
     df["datetime"] = pd.to_datetime(df["datetime"], unit="ms")
     df = df.set_index("datetime")[["open","high","low","close","volume"]]
     return df.astype(float).sort_index()
 
 
-def fetch_binance_ticker(symbol):
-    """Get 24-hr price change stats."""
-    r = requests.get(f"{BINANCE_BASE}/api/v3/ticker/24hr",
+def _fetch_bybit(symbol, interval, limit):
+    bybit_iv = BYBIT_INTERVAL_MAP.get(interval, "15")
+    r = requests.get("https://api.bybit.com/v5/market/kline",
+                     params={"category": "spot", "symbol": symbol,
+                             "interval": bybit_iv, "limit": limit},
+                     timeout=15)
+    r.raise_for_status()
+    rows = r.json().get("result", {}).get("list", [])
+    if not rows:
+        raise Exception("No data from Bybit")
+    df = pd.DataFrame(rows, columns=[
+        "datetime", "open", "high", "low", "close", "volume", "turnover"])
+    df["datetime"] = pd.to_datetime(df["datetime"].astype(int), unit="ms")
+    df = df.set_index("datetime")[["open","high","low","close","volume"]]
+    return df.astype(float).sort_index()
+
+
+def fetch_crypto_candles(symbol, interval, limit=500):
+    """Try Binance first; fall back to Bybit if geo-blocked (HTTP 451)."""
+    try:
+        return _fetch_binance(symbol, interval, limit)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (451, 403):
+            return _fetch_bybit(symbol, interval, limit)
+        raise
+
+
+def _ticker_binance(symbol):
+    r = requests.get("https://api.binance.com/api/v3/ticker/24hr",
                      params={"symbol": symbol}, timeout=10)
+    r.raise_for_status()
     return r.json()
+
+
+def _ticker_bybit(symbol):
+    r = requests.get("https://api.bybit.com/v5/market/tickers",
+                     params={"category": "spot", "symbol": symbol}, timeout=10)
+    r.raise_for_status()
+    item = r.json().get("result", {}).get("list", [{}])[0]
+    return {
+        "highPrice":    item.get("highPrice24h", "0"),
+        "lowPrice":     item.get("lowPrice24h", "0"),
+        "quoteVolume":  item.get("turnover24h", "0"),
+    }
+
+
+def fetch_crypto_ticker(symbol):
+    """Try Binance first; fall back to Bybit if geo-blocked."""
+    try:
+        return _ticker_binance(symbol)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (451, 403):
+            return _ticker_bybit(symbol)
+        raise
 
 
 # ─────────────────────────────────────────────────────────────
@@ -866,8 +914,8 @@ with tab3:
 
         with st.spinner(f"Fetching {crypto_sym} from Binance…"):
             try:
-                df_c   = fetch_binance_candles(binance_sym, interval_code, limit)
-                ticker = fetch_binance_ticker(binance_sym)
+                df_c   = fetch_crypto_candles(binance_sym, interval_code, limit)
+                ticker = fetch_crypto_ticker(binance_sym)
 
                 sig = calc_enhanced_signal(df_c, int(crypto_adx),
                                            int(crypto_stp), float(crypto_stm))
