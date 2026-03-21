@@ -316,15 +316,15 @@ def fetch_candles(api_key, jwt, exchange, token, interval, days_back):
     raise Exception(d.get("message","No candle data"))
 
 # ─────────────────────────────────────────────────────────────
-# CRYPTO API  (Binance → Bybit fallback, no key required)
+# CRYPTO API  (Binance → Kraken fallback, no key required)
+# Kraken is US-based — works on Streamlit Cloud without geo-blocks
 # ─────────────────────────────────────────────────────────────
 
 CRYPTO_SYMBOLS = {
     "BTC/USDT":  "BTCUSDT",
     "ETH/USDT":  "ETHUSDT",
-    "BNB/USDT":  "BNBUSDT",
     "SOL/USDT":  "SOLUSDT",
-    "PAXG/USDT": "PAXGUSDT",
+    "BNB/USDT":  "BNBUSDT",
 }
 
 BINANCE_INTERVALS = {
@@ -334,9 +334,11 @@ BINANCE_INTERVALS = {
     "1 day":  ("1d",  365),
 }
 
-BYBIT_INTERVAL_MAP = {
-    "5m": "5", "15m": "15", "1h": "60", "1d": "D",
+KRAKEN_SYMBOL_MAP = {
+    "BTCUSDT": "XBTUSDT", "ETHUSDT": "ETHUSDT",
+    "SOLUSDT": "SOLUSDT", "BNBUSDT": "BNBUSDT",
 }
+KRAKEN_INTERVAL_MAP = {"5m": 5, "15m": 15, "1h": 60, "1d": 1440}
 
 
 def _fetch_binance(symbol, interval, limit):
@@ -353,31 +355,33 @@ def _fetch_binance(symbol, interval, limit):
     return df.astype(float).sort_index()
 
 
-def _fetch_bybit(symbol, interval, limit):
-    bybit_iv = BYBIT_INTERVAL_MAP.get(interval, "15")
-    r = requests.get("https://api.bybit.com/v5/market/kline",
-                     params={"category": "spot", "symbol": symbol,
-                             "interval": bybit_iv, "limit": limit},
+def _fetch_kraken(symbol, interval, limit):
+    kr_sym = KRAKEN_SYMBOL_MAP.get(symbol, symbol)
+    kr_iv  = KRAKEN_INTERVAL_MAP.get(interval, 15)
+    since  = int((datetime.now() - timedelta(minutes=kr_iv * limit)).timestamp())
+    r = requests.get("https://api.kraken.com/0/public/OHLC",
+                     params={"pair": kr_sym, "interval": kr_iv, "since": since},
                      timeout=15)
     r.raise_for_status()
-    rows = r.json().get("result", {}).get("list", [])
-    if not rows:
-        raise Exception("No data from Bybit")
+    data = r.json()
+    if data.get("error"):
+        raise Exception(f"Kraken: {data['error']}")
+    pair_key = list(data["result"].keys())
+    pair_key = [k for k in pair_key if k != "last"][0]
+    rows = data["result"][pair_key]
     df = pd.DataFrame(rows, columns=[
-        "datetime", "open", "high", "low", "close", "volume", "turnover"])
-    df["datetime"] = pd.to_datetime(df["datetime"].astype(int), unit="ms")
+        "datetime","open","high","low","close","vwap","volume","count"])
+    df["datetime"] = pd.to_datetime(df["datetime"].astype(int), unit="s")
     df = df.set_index("datetime")[["open","high","low","close","volume"]]
     return df.astype(float).sort_index()
 
 
 def fetch_crypto_candles(symbol, interval, limit=500):
-    """Try Binance first; fall back to Bybit if geo-blocked (HTTP 451)."""
+    """Try Binance first; fall back to Kraken if geo-blocked."""
     try:
         return _fetch_binance(symbol, interval, limit)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code in (451, 403):
-            return _fetch_bybit(symbol, interval, limit)
-        raise
+    except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError):
+        return _fetch_kraken(symbol, interval, min(limit, 720))
 
 
 def _ticker_binance(symbol):
@@ -387,26 +391,27 @@ def _ticker_binance(symbol):
     return r.json()
 
 
-def _ticker_bybit(symbol):
-    r = requests.get("https://api.bybit.com/v5/market/tickers",
-                     params={"category": "spot", "symbol": symbol}, timeout=10)
+def _ticker_kraken(symbol):
+    kr_sym = KRAKEN_SYMBOL_MAP.get(symbol, symbol)
+    r = requests.get("https://api.kraken.com/0/public/Ticker",
+                     params={"pair": kr_sym}, timeout=10)
     r.raise_for_status()
-    item = r.json().get("result", {}).get("list", [{}])[0]
+    data = r.json()
+    pair_key = [k for k in data.get("result", {}).keys()][0]
+    t = data["result"][pair_key]
     return {
-        "highPrice":    item.get("highPrice24h", "0"),
-        "lowPrice":     item.get("lowPrice24h", "0"),
-        "quoteVolume":  item.get("turnover24h", "0"),
+        "highPrice":   t["h"][1],
+        "lowPrice":    t["l"][1],
+        "quoteVolume": str(float(t["v"][1]) * float(t["p"][1])),
     }
 
 
 def fetch_crypto_ticker(symbol):
-    """Try Binance first; fall back to Bybit if geo-blocked."""
+    """Try Binance first; fall back to Kraken if geo-blocked."""
     try:
         return _ticker_binance(symbol)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code in (451, 403):
-            return _ticker_bybit(symbol)
-        raise
+    except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError):
+        return _ticker_kraken(symbol)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1261,12 +1266,12 @@ with tab3:
 
                 st.caption(
                     f"🕒 Last updated: {datetime.now().strftime('%H:%M:%S')}  |  "
-                    f"Source: Binance  |  Volume 24h: ${vol24/1e6:.1f}M  |  "
+                    f"Source: Binance/Kraken  |  Volume 24h: ${vol24/1e6:.1f}M  |  "
                     f"⚠️ Not financial advice"
                 )
 
             except Exception as ex:
-                st.error(f"❌ Binance error: {ex}")
+                st.error(f"❌ Data error: {ex}")
     else:
         st.info("👆 Select a coin & timeframe, then click **Analyze**")
         st.markdown("""
@@ -1288,7 +1293,6 @@ with tab3:
         |------|---------------|
         | BTC/USDT | Bitcoin — largest crypto |
         | ETH/USDT | Ethereum — DeFi leader |
-        | BNB/USDT | Binance Coin |
         | SOL/USDT | Solana |
-        | PAXG/USDT | Tokenised Gold — mirrors MCX Gold price |
+        | BNB/USDT | Binance Coin |
         """)

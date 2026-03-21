@@ -100,9 +100,13 @@ def calc_pivots(df):
             "R2": pp+(h-l), "S2": pp-(h-l),
             "R3": h+2*(pp-l), "S3": l-2*(h-pp)}
 
-# ── Crypto fetch (Binance → Bybit fallback) ──────────────
+# ── Crypto fetch (Binance → Kraken fallback) ─────────────
 
-BYBIT_INTERVAL_MAP = {"5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+KRAKEN_SYMBOL_MAP = {
+    "BTCUSDT": "XBTUSDT", "ETHUSDT": "ETHUSDT",
+    "SOLUSDT": "SOLUSDT", "BNBUSDT": "BNBUSDT",
+}
+KRAKEN_INTERVAL_MAP = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 
 def _fetch_binance(symbol, interval, limit):
     r = requests.get(f"{BINANCE_BASE}/api/v3/klines",
@@ -116,31 +120,33 @@ def _fetch_binance(symbol, interval, limit):
     df = df.set_index("datetime")[["open","high","low","close","volume"]]
     return df.astype(float).sort_index()
 
-def _fetch_bybit(symbol, interval, limit):
-    bybit_iv = BYBIT_INTERVAL_MAP.get(interval, "15")
-    r = requests.get("https://api.bybit.com/v5/market/kline",
-                     params={"category": "spot", "symbol": symbol,
-                             "interval": bybit_iv, "limit": limit},
+def _fetch_kraken(symbol, interval, limit):
+    from datetime import datetime, timedelta
+    kr_sym = KRAKEN_SYMBOL_MAP.get(symbol, symbol)
+    kr_iv  = KRAKEN_INTERVAL_MAP.get(interval, 15)
+    since  = int((datetime.now() - timedelta(minutes=kr_iv * limit)).timestamp())
+    r = requests.get("https://api.kraken.com/0/public/OHLC",
+                     params={"pair": kr_sym, "interval": kr_iv, "since": since},
                      timeout=15)
     r.raise_for_status()
-    rows = r.json().get("result", {}).get("list", [])
-    if not rows:
-        raise Exception("No data from Bybit")
+    data = r.json()
+    if data.get("error"):
+        raise Exception(f"Kraken: {data['error']}")
+    pair_key = [k for k in data["result"].keys() if k != "last"][0]
+    rows = data["result"][pair_key]
     df = pd.DataFrame(rows, columns=[
-        "datetime", "open", "high", "low", "close", "volume", "turnover"])
-    df["datetime"] = pd.to_datetime(df["datetime"].astype(int), unit="ms")
+        "datetime","open","high","low","close","vwap","volume","count"])
+    df["datetime"] = pd.to_datetime(df["datetime"].astype(int), unit="s")
     df = df.set_index("datetime")[["open","high","low","close","volume"]]
     return df.astype(float).sort_index()
 
 def fetch_candles(symbol, interval="15m", limit=500):
-    """Try Binance first; fall back to Bybit if geo-blocked (HTTP 451/403)."""
+    """Try Binance first; fall back to Kraken if geo-blocked."""
     try:
         return _fetch_binance(symbol, interval, limit)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code in (451, 403):
-            log.info(f"  Binance blocked (HTTP {e.response.status_code}), using Bybit…")
-            return _fetch_bybit(symbol, interval, limit)
-        raise
+    except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError) as e:
+        log.info(f"  Binance unavailable, switching to Kraken…")
+        return _fetch_kraken(symbol, interval, min(limit, 720))
 
 # ── Enhanced signal ───────────────────────────────────────
 
