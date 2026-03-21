@@ -385,19 +385,20 @@ def backtest_strategy(df, adx_period=14, st_period=10, st_mult=3.0,
 
 
 def backtest_v2(df, adx_period=14, st_period=10, st_mult=3.0):
-    """V2 strategy: EMA trend + ADX/DI + trailing stop. Higher win rate."""
+    """V2 strategy: EMA trend + ADX/DI + tight trail + time exit."""
     ema9  = calc_ema(df["close"], 9)
     ema21 = calc_ema(df["close"], 21)
     ema50 = calc_ema(df["close"], 50)
     adx, pdi, mdi = calc_adx(df, adx_period)
     _, dr = calc_supertrend(df, st_period, st_mult)
     rsi   = calc_rsi(df["close"], 14)
-    vwap  = calc_vwap(df)
     atr   = calc_atr(df["high"], df["low"], df["close"], 14)
 
     trades   = []
     in_trade = None
     lookback = 52
+    cooldown = 0
+    MAX_HOLD = 20
 
     for i in range(lookback, len(df)):
         price  = df["close"].iloc[i]
@@ -406,77 +407,91 @@ def backtest_v2(df, adx_period=14, st_period=10, st_mult=3.0):
         bar_dt = df.index[i]
         atr_v  = atr.iloc[i]
 
-        # ── manage open trade ─────────────────────
+        if cooldown > 0:
+            cooldown -= 1
+
         if in_trade is not None:
+            in_trade["bars_held"] = in_trade.get("bars_held", 0) + 1
+
             if in_trade["side"] == "BUY":
                 in_trade["peak"] = max(in_trade.get("peak", in_trade["entry"]), hi)
 
                 if lo <= in_trade["stop"]:
-                    in_trade["exit_price"] = in_trade["stop"]
-                    in_trade["exit_time"]  = bar_dt
                     pnl = in_trade["stop"] - in_trade["entry"]
-                    in_trade["result"] = "Breakeven" if abs(pnl) < 0.01 * in_trade["entry"] else ("SL Hit" if pnl < 0 else "Trail Stop")
-                    in_trade["pnl"] = pnl
-                    trades.append(in_trade); in_trade = None; continue
+                    lbl = "SL Hit" if pnl < 0 else ("Breakeven" if pnl < atr_v * 0.1 else "Trail Stop")
+                    in_trade.update({"exit_price": in_trade["stop"], "exit_time": bar_dt,
+                                     "result": lbl, "pnl": pnl})
+                    trades.append(in_trade); in_trade = None; cooldown = 3; continue
 
                 if hi >= in_trade["t1"] and not in_trade.get("t1_hit"):
                     in_trade["t1_hit"] = True
-                    in_trade["stop"]   = in_trade["entry"]
+                    in_trade["stop"] = in_trade["entry"] + 0.3 * in_trade["entry_atr"]
 
                 if in_trade.get("t1_hit"):
-                    trail = in_trade["peak"] - 1.0 * atr_v
+                    trail = in_trade["peak"] - 0.6 * atr_v
                     if trail > in_trade["stop"]:
                         in_trade["stop"] = trail
 
                 if hi >= in_trade["t2"]:
-                    in_trade["exit_price"] = in_trade["t2"]
-                    in_trade["exit_time"]  = bar_dt
-                    in_trade["result"]     = "T2 Hit"
-                    in_trade["pnl"]        = in_trade["t2"] - in_trade["entry"]
-                    trades.append(in_trade); in_trade = None; continue
+                    in_trade.update({"exit_price": in_trade["t2"], "exit_time": bar_dt,
+                                     "result": "T2 Hit", "pnl": in_trade["t2"] - in_trade["entry"]})
+                    trades.append(in_trade); in_trade = None; cooldown = 3; continue
 
-            else:  # SELL
+                if in_trade["bars_held"] >= MAX_HOLD and not in_trade.get("t1_hit"):
+                    pnl = price - in_trade["entry"]
+                    in_trade.update({"exit_price": price, "exit_time": bar_dt,
+                                     "result": "Time Exit", "pnl": pnl})
+                    trades.append(in_trade); in_trade = None; cooldown = 3; continue
+
+            else:
                 in_trade["trough"] = min(in_trade.get("trough", in_trade["entry"]), lo)
 
                 if hi >= in_trade["stop"]:
-                    in_trade["exit_price"] = in_trade["stop"]
-                    in_trade["exit_time"]  = bar_dt
                     pnl = in_trade["entry"] - in_trade["stop"]
-                    in_trade["result"] = "Breakeven" if abs(pnl) < 0.01 * in_trade["entry"] else ("SL Hit" if pnl < 0 else "Trail Stop")
-                    in_trade["pnl"] = pnl
-                    trades.append(in_trade); in_trade = None; continue
+                    lbl = "SL Hit" if pnl < 0 else ("Breakeven" if pnl < atr_v * 0.1 else "Trail Stop")
+                    in_trade.update({"exit_price": in_trade["stop"], "exit_time": bar_dt,
+                                     "result": lbl, "pnl": pnl})
+                    trades.append(in_trade); in_trade = None; cooldown = 3; continue
 
                 if lo <= in_trade["t1"] and not in_trade.get("t1_hit"):
                     in_trade["t1_hit"] = True
-                    in_trade["stop"]   = in_trade["entry"]
+                    in_trade["stop"] = in_trade["entry"] - 0.3 * in_trade["entry_atr"]
 
                 if in_trade.get("t1_hit"):
-                    trail = in_trade["trough"] + 1.0 * atr_v
+                    trail = in_trade["trough"] + 0.6 * atr_v
                     if trail < in_trade["stop"]:
                         in_trade["stop"] = trail
 
                 if lo <= in_trade["t2"]:
-                    in_trade["exit_price"] = in_trade["t2"]
-                    in_trade["exit_time"]  = bar_dt
-                    in_trade["result"]     = "T2 Hit"
-                    in_trade["pnl"]        = in_trade["entry"] - in_trade["t2"]
-                    trades.append(in_trade); in_trade = None; continue
+                    in_trade.update({"exit_price": in_trade["t2"], "exit_time": bar_dt,
+                                     "result": "T2 Hit", "pnl": in_trade["entry"] - in_trade["t2"]})
+                    trades.append(in_trade); in_trade = None; cooldown = 3; continue
+
+                if in_trade["bars_held"] >= MAX_HOLD and not in_trade.get("t1_hit"):
+                    pnl = in_trade["entry"] - price
+                    in_trade.update({"exit_price": price, "exit_time": bar_dt,
+                                     "result": "Time Exit", "pnl": pnl})
+                    trades.append(in_trade); in_trade = None; cooldown = 3; continue
             continue
 
-        # ── entry conditions ──────────────────────
-        ema_bull = ema9.iloc[i] > ema21.iloc[i] and price > ema50.iloc[i]
-        ema_bear = ema9.iloc[i] < ema21.iloc[i] and price < ema50.iloc[i]
+        if cooldown > 0:
+            continue
 
-        adx_ok   = adx.iloc[i] > 20
+        ema_gap_bull = (ema9.iloc[i] - ema21.iloc[i]) / ema21.iloc[i] > 0.001
+        ema_gap_bear = (ema21.iloc[i] - ema9.iloc[i]) / ema21.iloc[i] > 0.001
+        ema_bull = ema_gap_bull and price > ema50.iloc[i]
+        ema_bear = ema_gap_bear and price < ema50.iloc[i]
+
+        adx_ok   = adx.iloc[i] > 20 and adx.iloc[i] > adx.iloc[i-1]
         di_bull  = pdi.iloc[i] > mdi.iloc[i]
         di_bear  = mdi.iloc[i] > pdi.iloc[i]
-        rsi_bull = rsi.iloc[i] > 50 and rsi.iloc[i] < 75
-        rsi_bear = rsi.iloc[i] < 50 and rsi.iloc[i] > 25
+        rsi_bull = 50 < rsi.iloc[i] < 70
+        rsi_bear = 30 < rsi.iloc[i] < 50
         st_bull  = dr.iloc[i] == -1
         st_bear  = dr.iloc[i] == 1
 
-        pullback_buy  = lo <= ema9.iloc[i] * 1.002
-        pullback_sell = hi >= ema9.iloc[i] * 0.998
+        pullback_buy  = lo <= ema9.iloc[i] * 1.003
+        pullback_sell = hi >= ema9.iloc[i] * 0.997
 
         buy_score  = sum([ema_bull, adx_ok, di_bull, rsi_bull, st_bull, pullback_buy])
         sell_score = sum([ema_bear, adx_ok, di_bear, rsi_bear, st_bear, pullback_sell])
@@ -484,22 +499,22 @@ def backtest_v2(df, adx_period=14, st_period=10, st_mult=3.0):
         if buy_score >= 4:
             in_trade = {
                 "side": "BUY", "entry_time": bar_dt, "entry": price,
-                "stop": price - 2.0 * atr_v,
-                "t1":   price + 1.0 * atr_v,
-                "t2":   price + 2.5 * atr_v,
-                "t3":   price + 2.5 * atr_v,
+                "stop": price - 1.5 * atr_v,
+                "t1":   price + 1.5 * atr_v,
+                "t2":   price + 3.0 * atr_v,
+                "t3":   price + 3.0 * atr_v,
                 "score": buy_score, "best": "", "t1_hit": False,
-                "peak": price,
+                "peak": price, "entry_atr": atr_v, "bars_held": 0,
             }
         elif sell_score >= 4:
             in_trade = {
                 "side": "SELL", "entry_time": bar_dt, "entry": price,
-                "stop": price + 2.0 * atr_v,
-                "t1":   price - 1.0 * atr_v,
-                "t2":   price - 2.5 * atr_v,
-                "t3":   price - 2.5 * atr_v,
+                "stop": price + 1.5 * atr_v,
+                "t1":   price - 1.5 * atr_v,
+                "t2":   price - 3.0 * atr_v,
+                "t3":   price - 3.0 * atr_v,
                 "score": sell_score, "best": "", "t1_hit": False,
-                "trough": price,
+                "trough": price, "entry_atr": atr_v, "bars_held": 0,
             }
 
     if in_trade is not None:
@@ -1581,8 +1596,8 @@ with tab4:
     if use_v2:
         st.markdown("""<div style="background:#0d2b1a;border:1px solid #00e676;border-radius:8px;padding:10px 14px;font-size:0.85rem">
         <strong style="color:#00e676">V2 Strategy:</strong>
-        <span style="color:#c9d1d9">EMA 9/21/50 trend filter · ADX > 20 · DI crossover · RSI momentum (crosses 50) · SuperTrend · Pullback to EMA entry ·
-        SL 2× ATR · T1 at 1× ATR (then breakeven) · Trailing stop 1× ATR · Full exit at T2 (2.5× ATR)</span>
+        <span style="color:#c9d1d9">EMA 9/21/50 trend filter (0.1% gap required) · ADX > 20 &amp; rising · DI crossover · RSI 50-70 (buy) / 30-50 (sell) · SuperTrend · Pullback to EMA9 ·
+        SL 1.5× ATR · T1 at 1.5× ATR (then stop moves to entry+0.3 ATR = guaranteed profit) · Tight trail 0.6× ATR · Full exit at T2 (3× ATR) · Time exit at 20 bars if no T1 · 3-bar cooldown after exit</span>
         </div>""", unsafe_allow_html=True)
     else:
         st.markdown("""<div style="background:#1e1b0d;border:1px solid #ffd700;border-radius:8px;padding:10px 14px;font-size:0.85rem">
@@ -1621,8 +1636,10 @@ with tab4:
                     avg_loss   = losses["pnl"].mean() if len(losses) > 0 else 0
                     best_trade = tdf["pnl"].max()
                     worst_trade = tdf["pnl"].min()
-                    t3_hits = len(tdf[tdf["result"] == "T3 Hit"])
+                    t3_hits = len(tdf[tdf["result"].isin(["T3 Hit", "T2 Hit"])])
                     sl_hits = len(tdf[tdf["result"] == "SL Hit"])
+                    trail_hits = len(tdf[tdf["result"] == "Trail Stop"])
+                    time_exits = len(tdf[tdf["result"] == "Time Exit"])
                     open_trades = len(tdf[tdf["result"] == "Open"])
                     profit_factor = abs(wins["pnl"].sum() / losses["pnl"].sum()) if len(losses) > 0 and losses["pnl"].sum() != 0 else float("inf")
 
@@ -1638,11 +1655,13 @@ with tab4:
                     k5.metric("Avg Loss", f"${avg_loss:,.2f}")
                     k6.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞")
 
-                    k7, k8, k9, k10 = st.columns(4)
+                    k7, k8, k9, k10, k11, k12 = st.columns(6)
                     k7.metric("Best Trade", f"${best_trade:,.2f}")
                     k8.metric("Worst Trade", f"${worst_trade:,.2f}")
-                    k9.metric("T3 Hits 🎯", t3_hits)
+                    k9.metric("Target Hits 🎯", t3_hits)
                     k10.metric("SL Hits 🛑", sl_hits)
+                    k11.metric("Trail Stops 🔒", trail_hits)
+                    k12.metric("Time Exits ⏱️", time_exits)
 
                     # ── Equity curve ───────────────────────
                     st.subheader("💰 Equity Curve")
@@ -1683,10 +1702,17 @@ with tab4:
 
                     with res_c1:
                         result_counts = tdf["result"].value_counts()
+                        exit_color_map = {
+                            "T2 Hit": "#00e676", "T3 Hit": "#00e676",
+                            "Trail Stop": "#4CAF50", "Breakeven": "#ffd700",
+                            "Time Exit": "#ff9800", "SL Hit": "#ff5252",
+                            "Open": "#888",
+                        }
+                        pie_colors = [exit_color_map.get(r, "#888") for r in result_counts.index]
                         fig_pie = go.Figure(go.Pie(
                             labels=result_counts.index,
                             values=result_counts.values,
-                            marker=dict(colors=["#00e676", "#ff5252", "#ffd700", "#888"]),
+                            marker=dict(colors=pie_colors),
                             hole=0.45,
                             textinfo="label+value",
                         ))
