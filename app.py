@@ -147,6 +147,21 @@ def calc_vwap(df):
     return (cvv / cv).round(4)
 
 
+def calc_bbands(series, period=20, std_mult=2.0):
+    sma = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    return sma, sma + std_mult * std, sma - std_mult * std  # mid, upper, lower
+
+
+def calc_macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
 def calc_pivots(df):
     h=df["high"].iloc[-2]; l=df["low"].iloc[-2]; c=df["close"].iloc[-2]
     pp=(h+l+c)/3
@@ -513,6 +528,181 @@ def backtest_v2(df, adx_period=14, st_period=10, st_mult=3.0):
                 "t1":   price - 1.5 * atr_v,
                 "t2":   price - 3.0 * atr_v,
                 "t3":   price - 3.0 * atr_v,
+                "score": sell_score, "best": "", "t1_hit": False,
+                "trough": price, "entry_atr": atr_v, "bars_held": 0,
+            }
+
+    if in_trade is not None:
+        last_price = df["close"].iloc[-1]
+        pnl = (last_price - in_trade["entry"]) if in_trade["side"] == "BUY" else (in_trade["entry"] - last_price)
+        in_trade.update({"exit_price": last_price, "exit_time": df.index[-1],
+                         "result": "Open", "pnl": pnl})
+        trades.append(in_trade)
+
+    return trades
+
+
+def backtest_v3(df, adx_period=14, st_period=10, st_mult=3.0):
+    """V3 BTC Sniper: mean-reversion entries within the macro trend.
+    Targets 80%+ win rate with tight 1:1 R/R and multiple confirmations."""
+    ema50  = calc_ema(df["close"], 50)
+    ema200 = calc_ema(df["close"], 200)
+    ema9   = calc_ema(df["close"], 9)
+    adx, pdi, mdi = calc_adx(df, adx_period)
+    _, dr = calc_supertrend(df, st_period, st_mult)
+    rsi = calc_rsi(df["close"], 14)
+    atr = calc_atr(df["high"], df["low"], df["close"], 14)
+    vwap = calc_vwap(df)
+    bb_mid, bb_upper, bb_lower = calc_bbands(df["close"], 20, 2.0)
+    macd_line, macd_signal, macd_hist = calc_macd(df["close"])
+
+    trades = []
+    in_trade = None
+    lookback = 201
+    cooldown = 0
+    MAX_HOLD = 12
+
+    if len(df) < lookback + 10:
+        return trades
+
+    for i in range(lookback, len(df)):
+        price  = df["close"].iloc[i]
+        hi     = df["high"].iloc[i]
+        lo     = df["low"].iloc[i]
+        bar_dt = df.index[i]
+        atr_v  = atr.iloc[i]
+
+        if atr_v <= 0 or np.isnan(atr_v):
+            continue
+
+        if cooldown > 0:
+            cooldown -= 1
+
+        if in_trade is not None:
+            in_trade["bars_held"] = in_trade.get("bars_held", 0) + 1
+
+            if in_trade["side"] == "BUY":
+                in_trade["peak"] = max(in_trade.get("peak", in_trade["entry"]), hi)
+
+                if lo <= in_trade["stop"]:
+                    pnl = in_trade["stop"] - in_trade["entry"]
+                    lbl = "SL Hit" if pnl < 0 else ("Breakeven" if pnl < atr_v * 0.1 else "Trail Stop")
+                    in_trade.update({"exit_price": in_trade["stop"], "exit_time": bar_dt,
+                                     "result": lbl, "pnl": pnl})
+                    trades.append(in_trade); in_trade = None; cooldown = 5; continue
+
+                if hi >= in_trade["t1"] and not in_trade.get("t1_hit"):
+                    in_trade["t1_hit"] = True
+                    in_trade["stop"] = in_trade["entry"] + 0.4 * in_trade["entry_atr"]
+
+                if in_trade.get("t1_hit"):
+                    trail = in_trade["peak"] - 0.5 * atr_v
+                    if trail > in_trade["stop"]:
+                        in_trade["stop"] = trail
+
+                if hi >= in_trade["t2"]:
+                    in_trade.update({"exit_price": in_trade["t2"], "exit_time": bar_dt,
+                                     "result": "T2 Hit", "pnl": in_trade["t2"] - in_trade["entry"]})
+                    trades.append(in_trade); in_trade = None; cooldown = 5; continue
+
+                if in_trade["bars_held"] >= MAX_HOLD and not in_trade.get("t1_hit"):
+                    pnl = price - in_trade["entry"]
+                    in_trade.update({"exit_price": price, "exit_time": bar_dt,
+                                     "result": "Time Exit", "pnl": pnl})
+                    trades.append(in_trade); in_trade = None; cooldown = 5; continue
+
+            else:
+                in_trade["trough"] = min(in_trade.get("trough", in_trade["entry"]), lo)
+
+                if hi >= in_trade["stop"]:
+                    pnl = in_trade["entry"] - in_trade["stop"]
+                    lbl = "SL Hit" if pnl < 0 else ("Breakeven" if pnl < atr_v * 0.1 else "Trail Stop")
+                    in_trade.update({"exit_price": in_trade["stop"], "exit_time": bar_dt,
+                                     "result": lbl, "pnl": pnl})
+                    trades.append(in_trade); in_trade = None; cooldown = 5; continue
+
+                if lo <= in_trade["t1"] and not in_trade.get("t1_hit"):
+                    in_trade["t1_hit"] = True
+                    in_trade["stop"] = in_trade["entry"] - 0.4 * in_trade["entry_atr"]
+
+                if in_trade.get("t1_hit"):
+                    trail = in_trade["trough"] + 0.5 * atr_v
+                    if trail < in_trade["stop"]:
+                        in_trade["stop"] = trail
+
+                if lo <= in_trade["t2"]:
+                    in_trade.update({"exit_price": in_trade["t2"], "exit_time": bar_dt,
+                                     "result": "T2 Hit", "pnl": in_trade["entry"] - in_trade["t2"]})
+                    trades.append(in_trade); in_trade = None; cooldown = 5; continue
+
+                if in_trade["bars_held"] >= MAX_HOLD and not in_trade.get("t1_hit"):
+                    pnl = in_trade["entry"] - price
+                    in_trade.update({"exit_price": price, "exit_time": bar_dt,
+                                     "result": "Time Exit", "pnl": pnl})
+                    trades.append(in_trade); in_trade = None; cooldown = 5; continue
+            continue
+
+        if cooldown > 0:
+            continue
+
+        # ── MACRO TREND (EMA 50/200) ──
+        macro_bull = ema50.iloc[i] > ema200.iloc[i]
+        macro_bear = ema50.iloc[i] < ema200.iloc[i]
+
+        # ── MEAN-REVERSION ZONE ──
+        near_bb_lower = lo <= bb_lower.iloc[i] * 1.005
+        near_bb_upper = hi >= bb_upper.iloc[i] * 0.995
+        near_vwap_buy = lo <= vwap.iloc[i] * 1.003
+        near_vwap_sell = hi >= vwap.iloc[i] * 0.997
+        mr_buy = near_bb_lower or near_vwap_buy
+        mr_sell = near_bb_upper or near_vwap_sell
+
+        # ── RSI OVERSOLD/OVERBOUGHT WITHIN TREND ──
+        rsi_buy = 25 < rsi.iloc[i] < 45
+        rsi_sell = 55 < rsi.iloc[i] < 75
+
+        # ── MACD MOMENTUM TURNING ──
+        macd_turn_buy = macd_hist.iloc[i] > macd_hist.iloc[i-1] and macd_hist.iloc[i-1] < 0
+        macd_turn_sell = macd_hist.iloc[i] < macd_hist.iloc[i-1] and macd_hist.iloc[i-1] > 0
+
+        # ── ADX TREND STRENGTH ──
+        adx_ok = adx.iloc[i] > 18
+
+        # ── SUPERTREND DIRECTION ──
+        st_bull = dr.iloc[i] == -1
+        st_bear = dr.iloc[i] == 1
+
+        # ── VOLUME CONFIRMATION ──
+        vol_avg = df["volume"].iloc[max(0,i-20):i].mean()
+        vol_ok = df["volume"].iloc[i] > vol_avg * 0.8 if vol_avg > 0 else False
+
+        # ── PRICE NEAR EMA9 (not extended) ──
+        near_ema9_buy = abs(price - ema9.iloc[i]) / ema9.iloc[i] < 0.008
+        near_ema9_sell = abs(price - ema9.iloc[i]) / ema9.iloc[i] < 0.008
+
+        buy_conds = [macro_bull, mr_buy, rsi_buy, macd_turn_buy, adx_ok, st_bull, vol_ok, near_ema9_buy]
+        sell_conds = [macro_bear, mr_sell, rsi_sell, macd_turn_sell, adx_ok, st_bear, vol_ok, near_ema9_sell]
+
+        buy_score = sum(buy_conds)
+        sell_score = sum(sell_conds)
+
+        if buy_score >= 6 and macro_bull:
+            in_trade = {
+                "side": "BUY", "entry_time": bar_dt, "entry": price,
+                "stop": price - 1.0 * atr_v,
+                "t1":   price + 1.0 * atr_v,
+                "t2":   price + 2.0 * atr_v,
+                "t3":   price + 2.0 * atr_v,
+                "score": buy_score, "best": "", "t1_hit": False,
+                "peak": price, "entry_atr": atr_v, "bars_held": 0,
+            }
+        elif sell_score >= 6 and macro_bear:
+            in_trade = {
+                "side": "SELL", "entry_time": bar_dt, "entry": price,
+                "stop": price + 1.0 * atr_v,
+                "t1":   price - 1.0 * atr_v,
+                "t2":   price - 2.0 * atr_v,
+                "t3":   price - 2.0 * atr_v,
                 "score": sell_score, "best": "", "t1_hit": False,
                 "trough": price, "entry_atr": atr_v, "bars_held": 0,
             }
@@ -1576,7 +1766,8 @@ with tab4:
     bt_c0, bt_c1, bt_c2, bt_c3, bt_c4 = st.columns([2, 2, 1, 1, 1])
     with bt_c0:
         bt_strat = st.selectbox("Strategy", [
-            "V2 — EMA Trend + Trail (recommended)",
+            "V3 — BTC Sniper (80% target) ⭐",
+            "V2 — EMA Trend + Trail",
             "V1 — 7-Condition Original",
         ], key="bt_strat")
     with bt_c1:
@@ -1585,15 +1776,24 @@ with tab4:
         bt_tf = st.selectbox("Timeframe", list(BINANCE_INTERVALS.keys()),
                              index=1, key="bt_tf")
     with bt_c3:
-        bt_min = st.slider("Min Score", 4, 7, 5 if "V1" in bt_strat else 4, key="bt_min",
+        default_min = 6 if "V3" in bt_strat else (5 if "V1" in bt_strat else 4)
+        bt_min = st.slider("Min Score", 4, 8, default_min, key="bt_min",
                            help="Conditions needed to trigger entry")
     with bt_c4:
-        bt_atr = st.slider("SL Mult", 1.0, 3.0, 1.5 if "V1" in bt_strat else 2.0, 0.5, key="bt_atr",
+        default_atr = 1.0 if "V3" in bt_strat else (1.5 if "V1" in bt_strat else 1.5)
+        bt_atr = st.slider("SL Mult", 0.5, 3.0, default_atr, 0.5, key="bt_atr",
                            help="ATR multiplier for stop-loss distance")
 
-    use_v2 = "V2" in bt_strat
+    strat_choice = "V3" if "V3" in bt_strat else ("V2" if "V2" in bt_strat else "V1")
 
-    if use_v2:
+    if strat_choice == "V3":
+        st.markdown("""<div style="background:#0d1b2a;border:1px solid #2962FF;border-radius:8px;padding:10px 14px;font-size:0.85rem">
+        <strong style="color:#2962FF">V3 BTC Sniper — 80% Win-Rate Target:</strong>
+        <span style="color:#c9d1d9">EMA 50/200 macro trend filter (only trade WITH the big trend) · Mean-reversion entry at Bollinger Band or VWAP · RSI oversold-in-uptrend 25-45 / overbought-in-downtrend 55-75 ·
+        MACD histogram turning · ADX > 18 · SuperTrend · Volume confirm · Near EMA9 ·
+        SL 1× ATR (tight — entry is at support) · T1 at 1× ATR (then stop → entry+0.4 ATR = locked profit) · Trail 0.5× ATR · T2 at 2× ATR · Time exit 12 bars · 5-bar cooldown · Needs 6/8 conditions</span>
+        </div>""", unsafe_allow_html=True)
+    elif strat_choice == "V2":
         st.markdown("""<div style="background:#0d2b1a;border:1px solid #00e676;border-radius:8px;padding:10px 14px;font-size:0.85rem">
         <strong style="color:#00e676">V2 Strategy:</strong>
         <span style="color:#c9d1d9">EMA 9/21/50 trend filter (0.1% gap required) · ADX > 20 &amp; rising · DI crossover · RSI 50-70 (buy) / 30-50 (sell) · SuperTrend · Pullback to EMA9 ·
@@ -1613,7 +1813,9 @@ with tab4:
         with st.spinner(f"Fetching {bt_sym} data & running backtest…"):
             try:
                 df_bt = fetch_crypto_candles(binance_sym, interval_code, limit)
-                if use_v2:
+                if strat_choice == "V3":
+                    trades = backtest_v3(df_bt)
+                elif strat_choice == "V2":
                     trades = backtest_v2(df_bt)
                 else:
                     trades = backtest_strategy(df_bt, min_score=bt_min,
@@ -1762,10 +1964,12 @@ with tab4:
                                        f"backtest_{bt_sym}_{bt_tf}.csv",
                                        "text/csv", use_container_width=True)
 
+                    max_conds = 8 if strat_choice == "V3" else 7
                     st.caption(f"🕒 Backtest ran on {len(df_bt)} candles  |  "
                                f"Period: {df_bt.index[0].strftime('%Y-%m-%d')} → "
                                f"{df_bt.index[-1].strftime('%Y-%m-%d')}  |  "
-                               f"Min score: {bt_min}/7  |  SL: {bt_atr}× ATR")
+                               f"Strategy: {strat_choice}  |  "
+                               f"Min score: {bt_min}/{max_conds}  |  SL: {bt_atr}× ATR")
 
             except Exception as ex:
                 st.error(f"❌ Backtest error: {ex}")
@@ -1773,40 +1977,58 @@ with tab4:
     else:
         st.info("👆 Select a strategy, coin, and settings, then click **Run Backtest**")
 
-        cmp1, cmp2 = st.columns(2)
+        cmp1, cmp2, cmp3 = st.columns(3)
         with cmp1:
             st.markdown("""
-            ### 🟢 V2 — EMA Trend + Trail (recommended)
+            ### ⭐ V3 — BTC Sniper (80%)
 
-            **Why it wins more:** Trades WITH the trend, not against it.
+            **How:** Mean-reversion in macro trend.
 
-            | Feature | How it helps |
+            | Feature | Why it works |
             |---------|-------------|
-            | EMA 9 > EMA 21 | Only trade in trend direction |
-            | Price > EMA 50 | Confirms bigger trend |
-            | ADX > 20 | Catches trends earlier (not 25) |
-            | Pullback to EMA 9 | Better entry price, not chasing |
-            | RSI crosses 50 | Momentum confirmation |
-            | SL = 2× ATR | Survives noise, fewer stop-outs |
-            | T1 = 1× ATR | Easy first target → breakeven |
-            | Trailing stop | Rides winners, locks profit |
-            | T2 = 2.5× ATR | Realistic full target |
+            | EMA 50 > 200 | Trade only WITH big trend |
+            | Bollinger Band bounce | Entry at oversold level |
+            | VWAP support | Institutional price anchor |
+            | MACD turning | Momentum shifting back |
+            | RSI 25-45 (buy zone) | Oversold within uptrend |
+            | SL = 1× ATR | Tight stop (entry at support) |
+            | T1 = 1× ATR → lock profit | Guaranteed $ after T1 |
+            | Trail = 0.5× ATR | Very tight, keeps gains |
+            | 12-bar time exit | Kills dead trades fast |
+            | 6/8 conditions needed | Very selective = high WR |
             """)
 
         with cmp2:
             st.markdown("""
+            ### 🟢 V2 — EMA Trend + Trail
+
+            **How:** Trend-following with pullback.
+
+            | Feature | How it helps |
+            |---------|-------------|
+            | EMA 9 > EMA 21 | Trade in trend direction |
+            | Price > EMA 50 | Confirms bigger trend |
+            | ADX > 20 & rising | Trend accelerating |
+            | Pullback to EMA 9 | Better entry price |
+            | SL = 1.5× ATR | Balanced stop |
+            | T1 = 1.5× ATR → lock | Guaranteed profit |
+            | Trail = 0.6× ATR | Tighter trailing |
+            | 20-bar time exit | Stops bleeders |
+            """)
+
+        with cmp3:
+            st.markdown("""
             ### 🟡 V1 — 7-Condition Original
 
-            **Issue:** Very strict entry, but exits are rigid.
+            **Issue:** Strict entry, rigid exits.
 
             | Feature | Problem |
             |---------|---------|
-            | 7 conditions needed | Enters late, after move started |
-            | No trend filter | Can enter against the trend |
-            | SL = 1.5× ATR | Too tight, gets clipped by noise |
-            | T3 = 4.5× ATR | Too far, rarely reached |
+            | 7 conditions | Enters late |
+            | No trend filter | Can fight trend |
+            | SL = 1.5× ATR | Clipped by noise |
+            | T3 = 4.5× ATR | Rarely reached |
             | No trailing stop | Gives back profits |
-            | Volume spike | Filters out too many good setups |
 
-            Still useful for very selective, high-conviction entries.
+            For high-conviction signals only.
             """)
