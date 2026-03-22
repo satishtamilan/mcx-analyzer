@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: btc-v3-sniper
+    runtime: python
+    buildCommand: pip install requests pandas numpy alpaca-py
+    startCommand: python alpaca_trader.py --loop
+    envVars:
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: RISK_PCT
+        value: "2"
+      - key: SENDER_EMAIL
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: RECIPIENT_EMAIL
+        sync: false
