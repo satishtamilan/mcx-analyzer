@@ -1178,8 +1178,9 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 
 st.markdown("## 📊 MCX & Crypto Analyzer")
-tab1, tab2, tab3, tab4 = st.tabs(["📈  MCX Chart", "🔔  MCX BUY / SELL Alert",
-                                  "₿  Crypto Strategy", "📊  Backtest & Track"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈  MCX Chart", "🔔  MCX BUY / SELL Alert",
+                                  "₿  Crypto Strategy", "📊  Backtest & Track",
+                                  "📝  Paper Trade"])
 
 # Guard flag — MCX tabs need login
 mcx_ready = "jwt" in st.session_state
@@ -1835,8 +1836,8 @@ with tab4:
     bt_c0, bt_c1, bt_c2, bt_c3, bt_c4 = st.columns([2, 2, 1, 1, 1])
     with bt_c0:
         bt_strat = st.selectbox("Strategy", [
-            "V3 — BTC Sniper (80% target) ⭐",
-            "V2 — EMA Trend + Trail",
+            "V3 — BTC Sniper 81% (BTC only) ⭐",
+            "V2 — EMA Trend + Trail (all coins)",
             "V1 — 7-Condition Original",
         ], key="bt_strat")
     with bt_c1:
@@ -2104,3 +2105,334 @@ with tab4:
 
             For high-conviction signals only.
             """)
+
+# ───────────────────── TAB 5 — PAPER TRADE ──────────────
+with tab5:
+    st.markdown("## 📝 Paper Trade — BTC Sniper V3 (Live)")
+    st.markdown("""<div style="background:#0d1b2a;border:1px solid #2962FF;border-radius:8px;padding:12px 16px;margin-bottom:16px">
+    <span style="color:#c9d1d9">Trade BTC with virtual money using the V3 Sniper strategy. The system scans the latest 1-hour candles,
+    detects entry signals, tracks your position, and calculates live P&L. <b>No real money involved.</b></span>
+    </div>""", unsafe_allow_html=True)
+
+    if "pt_trades" not in st.session_state:
+        st.session_state["pt_trades"] = []
+    if "pt_active" not in st.session_state:
+        st.session_state["pt_active"] = None
+    if "pt_balance" not in st.session_state:
+        st.session_state["pt_balance"] = 10000.0
+    if "pt_start_balance" not in st.session_state:
+        st.session_state["pt_start_balance"] = 10000.0
+
+    pt_c1, pt_c2, pt_c3 = st.columns([1, 1, 1])
+    with pt_c1:
+        pt_balance_input = st.number_input("Starting Balance ($)", 1000, 1000000,
+                                           int(st.session_state["pt_start_balance"]),
+                                           step=1000, key="pt_bal_input")
+    with pt_c2:
+        pt_risk_pct = st.slider("Risk per Trade (%)", 1, 10, 2, key="pt_risk",
+                                help="% of balance risked per trade")
+    with pt_c3:
+        pt_tf = st.selectbox("Timeframe", ["1 hour", "15 min"], key="pt_tf")
+
+    pt_col1, pt_col2 = st.columns([1, 1])
+    with pt_col1:
+        scan_btn = st.button("🔍 Scan for Signal", type="primary", key="pt_scan",
+                             use_container_width=True)
+    with pt_col2:
+        reset_btn = st.button("🔄 Reset Paper Account", key="pt_reset",
+                              use_container_width=True)
+
+    if reset_btn:
+        st.session_state["pt_trades"] = []
+        st.session_state["pt_active"] = None
+        st.session_state["pt_balance"] = float(pt_balance_input)
+        st.session_state["pt_start_balance"] = float(pt_balance_input)
+        st.success("Paper account reset.")
+        st.rerun()
+
+    if pt_balance_input != st.session_state["pt_start_balance"] and not st.session_state["pt_trades"]:
+        st.session_state["pt_balance"] = float(pt_balance_input)
+        st.session_state["pt_start_balance"] = float(pt_balance_input)
+
+    if scan_btn:
+        interval_code, limit = BINANCE_INTERVALS[pt_tf]
+        with st.spinner("Fetching latest BTC data…"):
+            try:
+                df_pt = fetch_crypto_candles("BTCUSDT", interval_code, limit)
+                ticker_pt = fetch_crypto_ticker("BTCUSDT")
+                live_price = ticker_pt.get("price", df_pt["close"].iloc[-1])
+
+                ema50_pt  = calc_ema(df_pt["close"], 50)
+                ema200_pt = calc_ema(df_pt["close"], 200)
+                ema9_pt   = calc_ema(df_pt["close"], 9)
+                ema21_pt  = calc_ema(df_pt["close"], 21)
+                adx_pt, pdi_pt, mdi_pt = calc_adx(df_pt, 14)
+                _, dr_pt = calc_supertrend(df_pt, 10, 3.0)
+                rsi_pt = calc_rsi(df_pt["close"], 14)
+                atr_pt = calc_atr(df_pt["high"], df_pt["low"], df_pt["close"], 14)
+                vwap_pt = calc_vwap(df_pt)
+                bb_mid_pt, bb_upper_pt, bb_lower_pt = calc_bbands(df_pt["close"], 20, 2.0)
+                _, _, macd_hist_pt = calc_macd(df_pt["close"])
+
+                i = len(df_pt) - 1
+                price = df_pt["close"].iloc[i]
+                hi = df_pt["high"].iloc[i]
+                lo = df_pt["low"].iloc[i]
+                opn_v = df_pt["open"].iloc[i]
+                atr_v = atr_pt.iloc[i]
+
+                active = st.session_state["pt_active"]
+                if active is not None:
+                    if active["side"] == "BUY":
+                        active["peak"] = max(active.get("peak", active["entry"]), hi)
+                        current_pnl = live_price - active["entry"]
+
+                        if lo <= active["stop"]:
+                            pnl = active["stop"] - active["entry"]
+                            active.update({"exit_price": active["stop"], "exit_time": str(df_pt.index[i]),
+                                           "result": "SL Hit" if pnl < 0 else "Trail Stop",
+                                           "pnl": pnl, "pnl_pct": pnl / active["entry"] * 100})
+                            st.session_state["pt_balance"] += active["position_size"] * (pnl / active["entry"])
+                            st.session_state["pt_trades"].append(active)
+                            st.session_state["pt_active"] = None
+                        elif hi >= active["t1"] and not active.get("t1_hit"):
+                            active["t1_hit"] = True
+                            active["stop"] = active["entry"] + 0.25 * active["entry_atr"]
+                        elif hi >= active["t2"]:
+                            pnl = active["t2"] - active["entry"]
+                            active.update({"exit_price": active["t2"], "exit_time": str(df_pt.index[i]),
+                                           "result": "T2 Hit", "pnl": pnl,
+                                           "pnl_pct": pnl / active["entry"] * 100})
+                            st.session_state["pt_balance"] += active["position_size"] * (pnl / active["entry"])
+                            st.session_state["pt_trades"].append(active)
+                            st.session_state["pt_active"] = None
+                        else:
+                            if active.get("t1_hit"):
+                                trail = active["peak"] - 0.35 * atr_v
+                                if trail > active["stop"]:
+                                    active["stop"] = trail
+                    else:
+                        active["trough"] = min(active.get("trough", active["entry"]), lo)
+                        current_pnl = active["entry"] - live_price
+
+                        if hi >= active["stop"]:
+                            pnl = active["entry"] - active["stop"]
+                            active.update({"exit_price": active["stop"], "exit_time": str(df_pt.index[i]),
+                                           "result": "SL Hit" if pnl < 0 else "Trail Stop",
+                                           "pnl": pnl, "pnl_pct": pnl / active["entry"] * 100})
+                            st.session_state["pt_balance"] += active["position_size"] * (pnl / active["entry"])
+                            st.session_state["pt_trades"].append(active)
+                            st.session_state["pt_active"] = None
+                        elif lo <= active["t1"] and not active.get("t1_hit"):
+                            active["t1_hit"] = True
+                            active["stop"] = active["entry"] - 0.25 * active["entry_atr"]
+                        elif lo <= active["t2"]:
+                            pnl = active["entry"] - active["t2"]
+                            active.update({"exit_price": active["t2"], "exit_time": str(df_pt.index[i]),
+                                           "result": "T2 Hit", "pnl": pnl,
+                                           "pnl_pct": pnl / active["entry"] * 100})
+                            st.session_state["pt_balance"] += active["position_size"] * (pnl / active["entry"])
+                            st.session_state["pt_trades"].append(active)
+                            st.session_state["pt_active"] = None
+                        else:
+                            if active.get("t1_hit"):
+                                trail = active["trough"] + 0.35 * atr_v
+                                if trail < active["stop"]:
+                                    active["stop"] = trail
+
+                if st.session_state["pt_active"] is None:
+                    macro_bull = (ema50_pt.iloc[i] > ema200_pt.iloc[i] and
+                                  ema200_pt.iloc[i] > ema200_pt.iloc[i-5])
+                    macro_bear = (ema50_pt.iloc[i] < ema200_pt.iloc[i] and
+                                  ema200_pt.iloc[i] < ema200_pt.iloc[i-5])
+
+                    bullish_candle = price > opn_v
+                    bearish_candle = price < opn_v
+                    prev_bear = df_pt["close"].iloc[i-1] < df_pt["open"].iloc[i-1]
+                    prev_bull = df_pt["close"].iloc[i-1] > df_pt["open"].iloc[i-1]
+
+                    cr = hi - lo
+                    close_pos_buy = (price - lo) / cr if cr > 0 else 0
+                    close_pos_sell = (hi - price) / cr if cr > 0 else 0
+
+                    buy_rev = (bullish_candle and prev_bear and macro_bull and close_pos_buy > 0.55)
+                    sell_rev = (bearish_candle and prev_bull and macro_bear and close_pos_sell > 0.55)
+
+                    signal_found = None
+
+                    if buy_rev or sell_rev:
+                        prev_lo = df_pt["low"].iloc[i-1]
+                        prev_hi = df_pt["high"].iloc[i-1]
+                        tol = atr_v * 0.3
+
+                        conf_buy = sum([
+                            prev_lo <= bb_lower_pt.iloc[i-1] + tol,
+                            prev_lo <= vwap_pt.iloc[i-1] + tol,
+                            prev_lo <= ema21_pt.iloc[i-1] + tol,
+                            prev_lo <= ema50_pt.iloc[i-1] + tol,
+                        ])
+                        conf_sell = sum([
+                            prev_hi >= bb_upper_pt.iloc[i-1] - tol,
+                            prev_hi >= vwap_pt.iloc[i-1] - tol,
+                            prev_hi >= ema21_pt.iloc[i-1] - tol,
+                            prev_hi >= ema50_pt.iloc[i-1] - tol,
+                        ])
+
+                        rsi_was_low = any(rsi_pt.iloc[i-j] < 40 for j in range(1, 4))
+                        rsi_was_high = any(rsi_pt.iloc[i-j] > 60 for j in range(1, 4))
+                        rsi_recov = rsi_pt.iloc[i] > rsi_pt.iloc[i-1]
+                        rsi_decl = rsi_pt.iloc[i] < rsi_pt.iloc[i-1]
+                        macd_up = macd_hist_pt.iloc[i] > macd_hist_pt.iloc[i-1]
+                        macd_dn = macd_hist_pt.iloc[i] < macd_hist_pt.iloc[i-1]
+                        adx_ok = adx_pt.iloc[i] > 20
+                        di_b = pdi_pt.iloc[i] > mdi_pt.iloc[i]
+                        di_s = mdi_pt.iloc[i] > pdi_pt.iloc[i]
+                        st_b = dr_pt.iloc[i] == -1
+                        st_s = dr_pt.iloc[i] == 1
+                        vol_avg = df_pt["volume"].iloc[max(0,i-20):i].mean()
+                        vol_ok = df_pt["volume"].iloc[i] > vol_avg * 0.8 if vol_avg > 0 else False
+                        cb = abs(price - opn_v)
+                        strong_b = cb > cr * 0.4 if cr > 0 else False
+
+                        if buy_rev:
+                            sc = sum([conf_buy >= 2, rsi_was_low, rsi_recov, macd_up,
+                                      adx_ok, di_b, st_b, vol_ok, strong_b])
+                            if sc >= 6:
+                                signal_found = "BUY"
+                        elif sell_rev:
+                            sc = sum([conf_sell >= 2, rsi_was_high, rsi_decl, macd_dn,
+                                      adx_ok, di_s, st_s, vol_ok, strong_b])
+                            if sc >= 6:
+                                signal_found = "SELL"
+
+                    if signal_found:
+                        risk_amt = st.session_state["pt_balance"] * pt_risk_pct / 100
+                        sl_dist = 1.2 * atr_v
+                        pos_size = risk_amt / (sl_dist / live_price) if sl_dist > 0 else 0
+
+                        if signal_found == "BUY":
+                            new_trade = {
+                                "side": "BUY", "entry_time": str(df_pt.index[i]),
+                                "entry": live_price,
+                                "stop": live_price - 1.2 * atr_v,
+                                "t1": live_price + 0.6 * atr_v,
+                                "t2": live_price + 1.5 * atr_v,
+                                "entry_atr": atr_v, "score": sc,
+                                "position_size": pos_size, "t1_hit": False,
+                                "peak": live_price,
+                            }
+                        else:
+                            new_trade = {
+                                "side": "SELL", "entry_time": str(df_pt.index[i]),
+                                "entry": live_price,
+                                "stop": live_price + 1.2 * atr_v,
+                                "t1": live_price - 0.6 * atr_v,
+                                "t2": live_price - 1.5 * atr_v,
+                                "entry_atr": atr_v, "score": sc,
+                                "position_size": pos_size, "t1_hit": False,
+                                "trough": live_price,
+                            }
+                        st.session_state["pt_active"] = new_trade
+
+                st.session_state["pt_last_price"] = live_price
+                st.session_state["pt_last_scan"] = str(df_pt.index[i])
+                st.session_state["pt_indicators"] = {
+                    "ema50_200": "Bullish" if ema50_pt.iloc[i] > ema200_pt.iloc[i] else "Bearish",
+                    "adx": round(adx_pt.iloc[i], 1),
+                    "rsi": round(rsi_pt.iloc[i], 1),
+                    "atr": round(atr_v, 2),
+                }
+
+            except Exception as ex:
+                st.error(f"❌ Error: {ex}")
+
+    st.markdown("---")
+
+    bal = st.session_state["pt_balance"]
+    start_bal = st.session_state["pt_start_balance"]
+    total_pnl_pct = (bal - start_bal) / start_bal * 100
+    closed = st.session_state["pt_trades"]
+    wins = [t for t in closed if t.get("pnl", 0) > 0]
+    wr = len(wins) / len(closed) * 100 if closed else 0
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("💰 Balance", f"${bal:,.2f}",
+              f"{total_pnl_pct:+.1f}%" if closed else None)
+    b2.metric("📊 Total Trades", len(closed))
+    b3.metric("🎯 Win Rate", f"{wr:.0f}%" if closed else "—",
+              f"{len(wins)}W / {len(closed)-len(wins)}L" if closed else None)
+    b4.metric("📈 Total P&L", f"${bal - start_bal:+,.2f}" if closed else "—")
+
+    active = st.session_state["pt_active"]
+    if active is not None:
+        live_p = st.session_state.get("pt_last_price", active["entry"])
+        if active["side"] == "BUY":
+            unr_pnl = live_p - active["entry"]
+        else:
+            unr_pnl = active["entry"] - live_p
+        unr_pct = unr_pnl / active["entry"] * 100
+
+        color = "#00e676" if unr_pnl >= 0 else "#ff5252"
+        side_emoji = "🟢" if active["side"] == "BUY" else "🔴"
+        t1_status = "✅ HIT" if active.get("t1_hit") else "⏳ Pending"
+
+        st.markdown(f"""<div style="background:#1a1a2e;border:2px solid {color};border-radius:12px;padding:20px;margin:10px 0">
+        <h3 style="color:{color};margin:0">{side_emoji} ACTIVE TRADE — {active['side']} BTC</h3>
+        <table style="width:100%;color:#c9d1d9;margin-top:12px;font-size:1rem">
+        <tr><td><b>Entry:</b> ${active['entry']:,.2f}</td>
+            <td><b>Live Price:</b> ${live_p:,.2f}</td>
+            <td><b style="color:{color}">P&L: ${unr_pnl:,.2f} ({unr_pct:+.1f}%)</b></td></tr>
+        <tr><td><b>Stop Loss:</b> <span style="color:#ff5252">${active['stop']:,.2f}</span></td>
+            <td><b>T1:</b> ${active['t1']:,.2f} {t1_status}</td>
+            <td><b>T2:</b> ${active['t2']:,.2f}</td></tr>
+        <tr><td><b>Position Size:</b> ${active['position_size']:,.2f}</td>
+            <td><b>ATR:</b> ${active['entry_atr']:,.2f}</td>
+            <td><b>Score:</b> {active['score']}/9</td></tr>
+        </table>
+        </div>""", unsafe_allow_html=True)
+
+        st.info("💡 Click **Scan for Signal** periodically to update the trade. "
+                "The system will auto-manage stops, T1 lock, and trailing.")
+    else:
+        inds = st.session_state.get("pt_indicators")
+        if inds:
+            st.markdown(f"""<div style="background:#1a1a2e;border:1px solid #555;border-radius:12px;padding:20px;margin:10px 0">
+            <h3 style="color:#ffd700;margin:0">⏳ NO ACTIVE SIGNAL — Waiting for entry</h3>
+            <p style="color:#c9d1d9;margin-top:10px">Last scan: {st.session_state.get('pt_last_scan', '—')} |
+            BTC Price: ${st.session_state.get('pt_last_price', 0):,.2f} |
+            Trend: {inds['ema50_200']} | ADX: {inds['adx']} | RSI: {inds['rsi']} | ATR: ${inds['atr']}</p>
+            <p style="color:#888;font-size:0.85rem">The V3 Sniper waits for a dip to support + bounce confirmation.
+            Keep scanning every hour to catch the next setup.</p>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.info("👆 Click **Scan for Signal** to start scanning BTC for V3 entry setups.")
+
+    if closed:
+        st.markdown("### 📋 Trade History")
+        hist_data = []
+        for t in reversed(closed):
+            pnl_color = "🟢" if t.get("pnl", 0) > 0 else "🔴"
+            hist_data.append({
+                "": pnl_color,
+                "Side": t["side"],
+                "Entry": f"${t['entry']:,.2f}",
+                "Exit": f"${t.get('exit_price', 0):,.2f}",
+                "P&L": f"${t.get('pnl', 0):,.2f}",
+                "Result": t.get("result", "—"),
+                "Score": t.get("score", "—"),
+                "Time": t.get("entry_time", "—"),
+            })
+        st.dataframe(pd.DataFrame(hist_data), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("""<div style="background:#1e1b0d;border:1px solid #ffd700;border-radius:8px;padding:12px 16px;font-size:0.85rem">
+    <strong style="color:#ffd700">How to Paper Trade:</strong>
+    <ol style="color:#c9d1d9;margin:8px 0">
+    <li>Set your starting balance and risk % per trade</li>
+    <li>Click <b>Scan for Signal</b> — the system runs V3 on the latest 1000 BTC candles</li>
+    <li>If conditions are met, it automatically opens a paper trade with calculated position size</li>
+    <li>Keep clicking <b>Scan</b> every hour — the system manages stops, T1 lock, and trailing</li>
+    <li>When a trade closes (SL/T1/T2/Trail), it logs in history and updates your balance</li>
+    <li>Track your win rate and P&L to validate the strategy before going live</li>
+    </ol>
+    </div>""", unsafe_allow_html=True)
