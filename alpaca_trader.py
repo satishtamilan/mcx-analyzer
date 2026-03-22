@@ -534,7 +534,16 @@ def main():
 
     if not args.loop:
         tick_position(client)
-        scan_for_signal(client, risk_pct)
+        minute = datetime.now().minute
+        if minute < 10:
+            scan_for_signal(client, risk_pct)
+        else:
+            positions = client.get_all_positions()
+            has_btc = any(p.symbol in ("BTC/USD", "BTCUSD") for p in positions)
+            if has_btc:
+                log.info("Position monitored. Next signal scan at the top of the hour.")
+            else:
+                log.info(f"No position, no signal scan (minute={minute}, scans at :00-:09). Waiting.")
         return
 
     TICK_INTERVAL = 60

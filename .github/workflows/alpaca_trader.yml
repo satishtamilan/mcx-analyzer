@@ -2,13 +2,13 @@ name: BTC V3 Sniper — Alpaca Auto Trader
 
 on:
   schedule:
-    - cron: '5 * * * *'  # Runs 5 minutes past every hour (after candle close)
-  workflow_dispatch:       # allows manual trigger from GitHub UI
+    - cron: '*/5 * * * *'  # Every 5 minutes: check position + hourly signal scan
+  workflow_dispatch:         # allows manual trigger from GitHub UI
 
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
 
     steps:
       - uses: actions/checkout@v5
