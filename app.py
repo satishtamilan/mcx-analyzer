@@ -665,10 +665,14 @@ def backtest_v3(df, adx_period=14, st_period=10, st_mult=3.0):
         prev_bearish   = df["close"].iloc[i-1] < opn.iloc[i-1]
         prev_bullish   = df["close"].iloc[i-1] > opn.iloc[i-1]
 
-        # BUY: current candle must be green AND previous was red (reversal)
-        # SELL: current candle must be red AND previous was green
-        buy_reversal  = bullish_candle and prev_bearish and macro_bull
-        sell_reversal = bearish_candle and prev_bullish and macro_bear
+        candle_range_now = hi - lo
+        close_position_buy  = (price - lo) / candle_range_now if candle_range_now > 0 else 0
+        close_position_sell = (hi - price) / candle_range_now if candle_range_now > 0 else 0
+        strong_close_buy  = close_position_buy > 0.55
+        strong_close_sell = close_position_sell > 0.55
+
+        buy_reversal  = bullish_candle and prev_bearish and macro_bull and strong_close_buy
+        sell_reversal = bearish_candle and prev_bullish and macro_bear and strong_close_sell
 
         if not buy_reversal and not sell_reversal:
             continue
@@ -741,10 +745,10 @@ def backtest_v3(df, adx_period=14, st_period=10, st_mult=3.0):
             if score >= 6:
                 in_trade = {
                     "side": "BUY", "entry_time": bar_dt, "entry": price,
-                    "stop": price - 1.0 * atr_v,
-                    "t1":   price + 0.8 * atr_v,
-                    "t2":   price + 1.8 * atr_v,
-                    "t3":   price + 1.8 * atr_v,
+                    "stop": price - 1.2 * atr_v,
+                    "t1":   price + 0.6 * atr_v,
+                    "t2":   price + 1.5 * atr_v,
+                    "t3":   price + 1.5 * atr_v,
                     "score": score, "best": "", "t1_hit": False,
                     "peak": price, "entry_atr": atr_v, "bars_held": 0,
                 }
@@ -764,10 +768,10 @@ def backtest_v3(df, adx_period=14, st_period=10, st_mult=3.0):
             if score >= 6:
                 in_trade = {
                     "side": "SELL", "entry_time": bar_dt, "entry": price,
-                    "stop": price + 1.0 * atr_v,
-                    "t1":   price - 0.8 * atr_v,
-                    "t2":   price - 1.8 * atr_v,
-                    "t3":   price - 1.8 * atr_v,
+                    "stop": price + 1.2 * atr_v,
+                    "t1":   price - 0.6 * atr_v,
+                    "t2":   price - 1.5 * atr_v,
+                    "t3":   price - 1.5 * atr_v,
                     "score": score, "best": "", "t1_hit": False,
                     "trough": price, "entry_atr": atr_v, "bars_held": 0,
                 }
@@ -1854,10 +1858,10 @@ with tab4:
     if strat_choice == "V3":
         st.markdown("""<div style="background:#0d1b2a;border:1px solid #2962FF;border-radius:8px;padding:10px 14px;font-size:0.85rem">
         <strong style="color:#2962FF">V3 BTC Sniper — Bounce Confirmation:</strong>
-        <span style="color:#c9d1d9"><b>Hard gates:</b> EMA 50/200 macro trend + slope rising · Reversal candle (green after red / red after green) ·
+        <span style="color:#c9d1d9"><b>Hard gates:</b> EMA 50/200 macro trend + slope rising · Reversal candle closing in upper 55% of range ·
         <b>Confluence:</b> Previous bar must touch 2+ support zones (BB lower, VWAP, EMA 21, EMA 50) ·
         <b>Score 6/9:</b> RSI was &lt;40 recently + recovering · MACD turning · ADX &gt; 20 · DI direction · SuperTrend · Volume · Strong candle body ·
-        SL 1× ATR · T1 0.8× ATR (then lock entry+0.25 ATR) · Trail 0.35× ATR · T2 1.8× ATR · Time exit 10 bars · 8-bar cooldown · 1000 candles</span>
+        SL 1.2× ATR · T1 0.6× ATR (fast profit → lock entry+0.25 ATR) · Trail 0.35× ATR · T2 1.5× ATR · Time exit 10 bars · 8-bar cooldown</span>
         </div>""", unsafe_allow_html=True)
     elif strat_choice == "V2":
         st.markdown("""<div style="background:#0d2b1a;border:1px solid #00e676;border-radius:8px;padding:10px 14px;font-size:0.85rem">
