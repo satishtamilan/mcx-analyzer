@@ -543,8 +543,8 @@ def backtest_v2(df, adx_period=14, st_period=10, st_mult=3.0):
 
 
 def backtest_v3(df, adx_period=14, st_period=10, st_mult=3.0):
-    """V3 BTC Sniper: mean-reversion at support within a confirmed macro trend.
-    Targets 75-80% win rate via ultra-selective entries + quick take-profits."""
+    """V3 BTC Sniper: bounce-confirmation entries at support confluence.
+    Waits for dip + reversal candle instead of catching the knife."""
     ema9   = calc_ema(df["close"], 9)
     ema21  = calc_ema(df["close"], 21)
     ema50  = calc_ema(df["close"], 50)
@@ -555,15 +555,15 @@ def backtest_v3(df, adx_period=14, st_period=10, st_mult=3.0):
     atr = calc_atr(df["high"], df["low"], df["close"], 14)
     vwap = calc_vwap(df)
     bb_mid, bb_upper, bb_lower = calc_bbands(df["close"], 20, 2.0)
-    bb_width = (bb_upper - bb_lower) / bb_mid
     macd_line, macd_signal, macd_hist = calc_macd(df["close"])
+
+    opn = df["open"]
 
     trades = []
     in_trade = None
     lookback = 210
     cooldown = 0
     MAX_HOLD = 10
-    MIN_SCORE = 7
 
     if len(df) < lookback + 10:
         return trades
@@ -592,27 +592,27 @@ def backtest_v3(df, adx_period=14, st_period=10, st_mult=3.0):
                     lbl = "SL Hit" if pnl < 0 else ("Breakeven" if pnl < atr_v * 0.05 else "Trail Stop")
                     in_trade.update({"exit_price": in_trade["stop"], "exit_time": bar_dt,
                                      "result": lbl, "pnl": pnl})
-                    trades.append(in_trade); in_trade = None; cooldown = 6; continue
+                    trades.append(in_trade); in_trade = None; cooldown = 8; continue
 
                 if hi >= in_trade["t1"] and not in_trade.get("t1_hit"):
                     in_trade["t1_hit"] = True
-                    in_trade["stop"] = in_trade["entry"] + 0.3 * in_trade["entry_atr"]
+                    in_trade["stop"] = in_trade["entry"] + 0.25 * in_trade["entry_atr"]
 
                 if in_trade.get("t1_hit"):
-                    trail = in_trade["peak"] - 0.4 * atr_v
+                    trail = in_trade["peak"] - 0.35 * atr_v
                     if trail > in_trade["stop"]:
                         in_trade["stop"] = trail
 
                 if hi >= in_trade["t2"]:
                     in_trade.update({"exit_price": in_trade["t2"], "exit_time": bar_dt,
                                      "result": "T2 Hit", "pnl": in_trade["t2"] - in_trade["entry"]})
-                    trades.append(in_trade); in_trade = None; cooldown = 6; continue
+                    trades.append(in_trade); in_trade = None; cooldown = 8; continue
 
                 if in_trade["bars_held"] >= MAX_HOLD and not in_trade.get("t1_hit"):
                     pnl = price - in_trade["entry"]
                     in_trade.update({"exit_price": price, "exit_time": bar_dt,
                                      "result": "Time Exit", "pnl": pnl})
-                    trades.append(in_trade); in_trade = None; cooldown = 6; continue
+                    trades.append(in_trade); in_trade = None; cooldown = 8; continue
 
             else:
                 in_trade["trough"] = min(in_trade.get("trough", in_trade["entry"]), lo)
@@ -622,110 +622,155 @@ def backtest_v3(df, adx_period=14, st_period=10, st_mult=3.0):
                     lbl = "SL Hit" if pnl < 0 else ("Breakeven" if pnl < atr_v * 0.05 else "Trail Stop")
                     in_trade.update({"exit_price": in_trade["stop"], "exit_time": bar_dt,
                                      "result": lbl, "pnl": pnl})
-                    trades.append(in_trade); in_trade = None; cooldown = 6; continue
+                    trades.append(in_trade); in_trade = None; cooldown = 8; continue
 
                 if lo <= in_trade["t1"] and not in_trade.get("t1_hit"):
                     in_trade["t1_hit"] = True
-                    in_trade["stop"] = in_trade["entry"] - 0.3 * in_trade["entry_atr"]
+                    in_trade["stop"] = in_trade["entry"] - 0.25 * in_trade["entry_atr"]
 
                 if in_trade.get("t1_hit"):
-                    trail = in_trade["trough"] + 0.4 * atr_v
+                    trail = in_trade["trough"] + 0.35 * atr_v
                     if trail < in_trade["stop"]:
                         in_trade["stop"] = trail
 
                 if lo <= in_trade["t2"]:
                     in_trade.update({"exit_price": in_trade["t2"], "exit_time": bar_dt,
                                      "result": "T2 Hit", "pnl": in_trade["entry"] - in_trade["t2"]})
-                    trades.append(in_trade); in_trade = None; cooldown = 6; continue
+                    trades.append(in_trade); in_trade = None; cooldown = 8; continue
 
                 if in_trade["bars_held"] >= MAX_HOLD and not in_trade.get("t1_hit"):
                     pnl = in_trade["entry"] - price
                     in_trade.update({"exit_price": price, "exit_time": bar_dt,
                                      "result": "Time Exit", "pnl": pnl})
-                    trades.append(in_trade); in_trade = None; cooldown = 6; continue
+                    trades.append(in_trade); in_trade = None; cooldown = 8; continue
             continue
 
         if cooldown > 0:
             continue
 
-        # ── 1. MACRO TREND: EMA 50 > 200 AND slope positive ──
+        # ═══════════════════════════════════════════════════
+        # HARD GATES — must ALL be true, otherwise skip bar
+        # ═══════════════════════════════════════════════════
+
         macro_bull = (ema50.iloc[i] > ema200.iloc[i] and
                       ema200.iloc[i] > ema200.iloc[i-5])
         macro_bear = (ema50.iloc[i] < ema200.iloc[i] and
                       ema200.iloc[i] < ema200.iloc[i-5])
 
-        # ── 2. EMA STACK: 9 > 21 > 50 alignment ──
-        ema_stack_bull = ema9.iloc[i] > ema21.iloc[i] > ema50.iloc[i]
-        ema_stack_bear = ema9.iloc[i] < ema21.iloc[i] < ema50.iloc[i]
+        if not macro_bull and not macro_bear:
+            continue
 
-        # ── 3. MEAN-REVERSION: BB %B + VWAP proximity ──
-        bb_range = bb_upper.iloc[i] - bb_lower.iloc[i]
-        pct_b = (price - bb_lower.iloc[i]) / bb_range if bb_range > 0 else 0.5
-        bb_buy  = pct_b < 0.25
-        bb_sell = pct_b > 0.75
-        near_vwap_buy  = price <= vwap.iloc[i] * 1.002
-        near_vwap_sell = price >= vwap.iloc[i] * 0.998
-        mr_buy  = bb_buy or near_vwap_buy
-        mr_sell = bb_sell or near_vwap_sell
+        bullish_candle = price > opn.iloc[i]
+        bearish_candle = price < opn.iloc[i]
+        prev_bearish   = df["close"].iloc[i-1] < opn.iloc[i-1]
+        prev_bullish   = df["close"].iloc[i-1] > opn.iloc[i-1]
 
-        # ── 4. RSI OVERSOLD/OVERBOUGHT WITHIN TREND ──
-        rsi_buy  = 25 < rsi.iloc[i] < 42
-        rsi_sell = 58 < rsi.iloc[i] < 75
+        # BUY: current candle must be green AND previous was red (reversal)
+        # SELL: current candle must be red AND previous was green
+        buy_reversal  = bullish_candle and prev_bearish and macro_bull
+        sell_reversal = bearish_candle and prev_bullish and macro_bear
 
-        # ── 5. MACD HISTOGRAM TURNING BACK ──
-        macd_turn_buy  = (macd_hist.iloc[i] > macd_hist.iloc[i-1] and
-                          macd_hist.iloc[i-1] <= macd_hist.iloc[i-2])
-        macd_turn_sell = (macd_hist.iloc[i] < macd_hist.iloc[i-1] and
-                          macd_hist.iloc[i-1] >= macd_hist.iloc[i-2])
+        if not buy_reversal and not sell_reversal:
+            continue
 
-        # ── 6. ADX TRENDING + RISING ──
-        adx_ok = adx.iloc[i] > 20 and adx.iloc[i] > adx.iloc[i-2]
+        # ═══════════════════════════════════════════════════
+        # SUPPORT/RESISTANCE CONFLUENCE (count zones nearby)
+        # ═══════════════════════════════════════════════════
+        prev_lo = df["low"].iloc[i-1]
+        prev_hi = df["high"].iloc[i-1]
+        tol = atr_v * 0.3
 
-        # ── 7. DI CONFIRMS DIRECTION ──
+        confluence_buy = 0
+        if prev_lo <= bb_lower.iloc[i-1] + tol:
+            confluence_buy += 1
+        if prev_lo <= vwap.iloc[i-1] + tol:
+            confluence_buy += 1
+        if prev_lo <= ema21.iloc[i-1] + tol:
+            confluence_buy += 1
+        if prev_lo <= ema50.iloc[i-1] + tol:
+            confluence_buy += 1
+
+        confluence_sell = 0
+        if prev_hi >= bb_upper.iloc[i-1] - tol:
+            confluence_sell += 1
+        if prev_hi >= vwap.iloc[i-1] - tol:
+            confluence_sell += 1
+        if prev_hi >= ema21.iloc[i-1] - tol:
+            confluence_sell += 1
+        if prev_hi >= ema50.iloc[i-1] - tol:
+            confluence_sell += 1
+
+        # ═══════════════════════════════════════════════════
+        # CONFIRMATION CONDITIONS (score-based)
+        # ═══════════════════════════════════════════════════
+        rsi_was_low  = any(rsi.iloc[i-j] < 40 for j in range(1, 4))
+        rsi_was_high = any(rsi.iloc[i-j] > 60 for j in range(1, 4))
+        rsi_recovering = rsi.iloc[i] > rsi.iloc[i-1]
+        rsi_declining  = rsi.iloc[i] < rsi.iloc[i-1]
+
+        macd_turn_buy  = macd_hist.iloc[i] > macd_hist.iloc[i-1]
+        macd_turn_sell = macd_hist.iloc[i] < macd_hist.iloc[i-1]
+
+        adx_ok = adx.iloc[i] > 20
+
         di_bull = pdi.iloc[i] > mdi.iloc[i]
         di_bear = mdi.iloc[i] > pdi.iloc[i]
 
-        # ── 8. SUPERTREND DIRECTION ──
         st_bull = dr.iloc[i] == -1
         st_bear = dr.iloc[i] == 1
 
-        # ── 9. VOLUME ABOVE AVERAGE ──
         vol_avg = df["volume"].iloc[max(0,i-20):i].mean()
-        vol_ok = df["volume"].iloc[i] > vol_avg * 0.9 if vol_avg > 0 else False
+        vol_ok = df["volume"].iloc[i] > vol_avg * 0.8 if vol_avg > 0 else False
 
-        # ── 10. CANDLE NOT EXTENDED (wick rejection = support holds) ──
-        candle_body = abs(df["close"].iloc[i] - df["open"].iloc[i])
+        candle_body = abs(price - opn.iloc[i])
         candle_range = hi - lo
-        healthy_candle = candle_body > candle_range * 0.3 if candle_range > 0 else False
+        strong_body = candle_body > candle_range * 0.4 if candle_range > 0 else False
 
-        buy_conds = [macro_bull, ema_stack_bull, mr_buy, rsi_buy,
-                     macd_turn_buy, adx_ok, di_bull, st_bull, vol_ok, healthy_candle]
-        sell_conds = [macro_bear, ema_stack_bear, mr_sell, rsi_sell,
-                      macd_turn_sell, adx_ok, di_bear, st_bear, vol_ok, healthy_candle]
+        if buy_reversal:
+            score = sum([
+                confluence_buy >= 2,
+                rsi_was_low,
+                rsi_recovering,
+                macd_turn_buy,
+                adx_ok,
+                di_bull,
+                st_bull,
+                vol_ok,
+                strong_body,
+            ])
+            if score >= 6:
+                in_trade = {
+                    "side": "BUY", "entry_time": bar_dt, "entry": price,
+                    "stop": price - 1.0 * atr_v,
+                    "t1":   price + 0.8 * atr_v,
+                    "t2":   price + 1.8 * atr_v,
+                    "t3":   price + 1.8 * atr_v,
+                    "score": score, "best": "", "t1_hit": False,
+                    "peak": price, "entry_atr": atr_v, "bars_held": 0,
+                }
 
-        buy_score  = sum(buy_conds)
-        sell_score = sum(sell_conds)
-
-        if buy_score >= MIN_SCORE and macro_bull:
-            in_trade = {
-                "side": "BUY", "entry_time": bar_dt, "entry": price,
-                "stop": price - 0.8 * atr_v,
-                "t1":   price + 0.8 * atr_v,
-                "t2":   price + 1.6 * atr_v,
-                "t3":   price + 1.6 * atr_v,
-                "score": buy_score, "best": "", "t1_hit": False,
-                "peak": price, "entry_atr": atr_v, "bars_held": 0,
-            }
-        elif sell_score >= MIN_SCORE and macro_bear:
-            in_trade = {
-                "side": "SELL", "entry_time": bar_dt, "entry": price,
-                "stop": price + 0.8 * atr_v,
-                "t1":   price - 0.8 * atr_v,
-                "t2":   price - 1.6 * atr_v,
-                "t3":   price - 1.6 * atr_v,
-                "score": sell_score, "best": "", "t1_hit": False,
-                "trough": price, "entry_atr": atr_v, "bars_held": 0,
-            }
+        elif sell_reversal:
+            score = sum([
+                confluence_sell >= 2,
+                rsi_was_high,
+                rsi_declining,
+                macd_turn_sell,
+                adx_ok,
+                di_bear,
+                st_bear,
+                vol_ok,
+                strong_body,
+            ])
+            if score >= 6:
+                in_trade = {
+                    "side": "SELL", "entry_time": bar_dt, "entry": price,
+                    "stop": price + 1.0 * atr_v,
+                    "t1":   price - 0.8 * atr_v,
+                    "t2":   price - 1.8 * atr_v,
+                    "t3":   price - 1.8 * atr_v,
+                    "score": score, "best": "", "t1_hit": False,
+                    "trough": price, "entry_atr": atr_v, "bars_held": 0,
+                }
 
     if in_trade is not None:
         last_price = df["close"].iloc[-1]
@@ -1808,10 +1853,11 @@ with tab4:
 
     if strat_choice == "V3":
         st.markdown("""<div style="background:#0d1b2a;border:1px solid #2962FF;border-radius:8px;padding:10px 14px;font-size:0.85rem">
-        <strong style="color:#2962FF">V3 BTC Sniper — 75-80% Win-Rate Target:</strong>
-        <span style="color:#c9d1d9">EMA 50/200 macro trend + rising slope · EMA 9>21>50 stack · BB %B &lt; 0.25 or VWAP touch (mean-reversion) · RSI 25-42 oversold-in-uptrend ·
-        MACD histogram 2-bar turn · ADX > 20 &amp; rising · +DI/-DI direction · SuperTrend · Volume &gt; 90% avg · Healthy candle body ·
-        SL 0.8× ATR · T1 at 0.8× ATR (then stop → entry+0.3 ATR) · Trail 0.4× ATR · T2 at 1.6× ATR · Time exit 10 bars · 6-bar cooldown · Needs 7/10 conditions · 1000 candles</span>
+        <strong style="color:#2962FF">V3 BTC Sniper — Bounce Confirmation:</strong>
+        <span style="color:#c9d1d9"><b>Hard gates:</b> EMA 50/200 macro trend + slope rising · Reversal candle (green after red / red after green) ·
+        <b>Confluence:</b> Previous bar must touch 2+ support zones (BB lower, VWAP, EMA 21, EMA 50) ·
+        <b>Score 6/9:</b> RSI was &lt;40 recently + recovering · MACD turning · ADX &gt; 20 · DI direction · SuperTrend · Volume · Strong candle body ·
+        SL 1× ATR · T1 0.8× ATR (then lock entry+0.25 ATR) · Trail 0.35× ATR · T2 1.8× ATR · Time exit 10 bars · 8-bar cooldown · 1000 candles</span>
         </div>""", unsafe_allow_html=True)
     elif strat_choice == "V2":
         st.markdown("""<div style="background:#0d2b1a;border:1px solid #00e676;border-radius:8px;padding:10px 14px;font-size:0.85rem">
@@ -2002,22 +2048,22 @@ with tab4:
             st.markdown("""
             ### ⭐ V3 — BTC Sniper (75-80%)
 
-            **How:** Buy the dip in a confirmed uptrend.
+            **How:** Wait for bounce at support, not the dip.
 
             | Feature | Why it works |
             |---------|-------------|
-            | EMA 50>200 + rising slope | Confirmed macro trend |
-            | EMA 9>21>50 stack | All timeframes aligned |
-            | BB %B < 0.25 | Deep at support zone |
-            | VWAP proximity | Institutional anchor |
-            | MACD 2-bar turn | Momentum reversing back |
-            | ADX > 20 & rising | Strong, accelerating trend |
-            | Healthy candle body | No doji/indecision bars |
-            | SL = 0.8× ATR | Very tight (at support) |
-            | T1 = 0.8× ATR → lock | Quick profit, then safe |
-            | Trail = 0.4× ATR | Ultra-tight trail |
-            | 10-bar time exit | Kill dead trades fast |
-            | 7/10 conditions | Ultra-selective entries |
+            | EMA 50>200 + slope | Hard gate: macro trend |
+            | Reversal candle | Green after red = bounce |
+            | 2+ support confluence | BB + VWAP + EMA zones |
+            | RSI was <40 recently | Was oversold, recovering |
+            | MACD turning up | Momentum shifting back |
+            | ADX > 20 | Trending market |
+            | Strong candle body | Real conviction, not wick |
+            | SL = 1× ATR | Safe (entry after bounce) |
+            | T1 = 0.8× ATR → lock | Quick profit guaranteed |
+            | Trail = 0.35× ATR | Ultra-tight, keep gains |
+            | 8-bar cooldown | Avoid chop re-entry |
+            | 6/9 score needed | Selective + confirmed |
             """)
 
         with cmp2:
