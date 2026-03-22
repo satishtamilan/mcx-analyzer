@@ -255,10 +255,44 @@ def detect_v3_signal(df):
 
     return None
 
-# ── Trade Management ──────────────────────────────────────
+# ── Trade State (persists across ticks) ───────────────────
 
-def manage_position(client, df):
-    """Check open BTC position and manage stop/targets."""
+trade_state = {
+    "entry_atr": None,
+    "t1_hit": False,
+    "stop": None,
+    "t1": None,
+    "t2": None,
+    "peak": None,
+    "trough": None,
+    "side": None,
+}
+
+def init_trade_state(entry, atr_v, side):
+    """Initialize trade state when a new position is opened."""
+    trade_state["entry_atr"] = atr_v
+    trade_state["t1_hit"] = False
+    trade_state["side"] = side
+    trade_state["peak"] = entry
+    trade_state["trough"] = entry
+    if side == "LONG":
+        trade_state["stop"] = entry - 1.2 * atr_v
+        trade_state["t1"] = entry + 0.6 * atr_v
+        trade_state["t2"] = entry + 1.5 * atr_v
+    else:
+        trade_state["stop"] = entry + 1.2 * atr_v
+        trade_state["t1"] = entry - 0.6 * atr_v
+        trade_state["t2"] = entry - 1.5 * atr_v
+
+def reset_trade_state():
+    for k in trade_state:
+        trade_state[k] = None
+    trade_state["t1_hit"] = False
+
+# ── Trade Management (runs every minute) ──────────────────
+
+def manage_position(client):
+    """Check open BTC position with live price, manage SL/T1/T2/trail."""
     positions = client.get_all_positions()
     btc_pos = None
     for p in positions:
@@ -267,6 +301,8 @@ def manage_position(client, df):
             break
 
     if btc_pos is None:
+        if trade_state["side"] is not None:
+            reset_trade_state()
         return None
 
     entry = float(btc_pos.avg_entry_price)
@@ -275,51 +311,78 @@ def manage_position(client, df):
     side = btc_pos.side.value.upper()
     unr_pnl = float(btc_pos.unrealized_pl)
 
-    atr = calc_atr(df["high"], df["low"], df["close"], 14)
-    atr_v = atr.iloc[-1]
+    if trade_state["side"] is None:
+        log.info("Detected existing position without trade state — initializing from last ATR")
+        try:
+            df_quick = fetch_candles("BTCUSDT", "1h", 50)
+            atr_v = calc_atr(df_quick["high"], df_quick["low"], df_quick["close"], 14).iloc[-1]
+        except Exception:
+            atr_v = abs(entry * 0.015)
+        init_trade_state(entry, atr_v, side)
+
+    atr_v = trade_state["entry_atr"]
 
     if side == "LONG":
-        sl = entry - 1.2 * atr_v
-        t1 = entry + 0.6 * atr_v
-        t2 = entry + 1.5 * atr_v
+        trade_state["peak"] = max(trade_state.get("peak", entry), current)
 
-        if current <= sl:
-            log.warning(f"SL HIT — closing LONG at ${current:,.2f} (SL: ${sl:,.2f})")
+        if current <= trade_state["stop"]:
+            pnl_type = "TRAIL_STOP" if trade_state["t1_hit"] else "SL_HIT"
+            log.warning(f"{pnl_type} — closing LONG at ${current:,.2f} (stop: ${trade_state['stop']:,.2f})")
             client.close_position("BTC/USD")
-            return {"action": "SL_HIT", "pnl": unr_pnl, "price": current}
+            result = {"action": pnl_type, "pnl": unr_pnl, "price": current}
+            reset_trade_state()
+            return result
 
-        if current >= t2:
-            log.info(f"T2 HIT — closing LONG at ${current:,.2f} (T2: ${t2:,.2f})")
+        if current >= trade_state["t2"]:
+            log.info(f"T2 HIT — closing LONG at ${current:,.2f}")
             client.close_position("BTC/USD")
-            return {"action": "T2_HIT", "pnl": unr_pnl, "price": current}
+            result = {"action": "T2_HIT", "pnl": unr_pnl, "price": current}
+            reset_trade_state()
+            return result
 
-        if current >= t1:
-            trail_stop = current - 0.35 * atr_v
-            if trail_stop > entry + 0.25 * atr_v:
-                log.info(f"T1 hit, trailing. Current: ${current:,.2f}, Trail SL: ${trail_stop:,.2f}")
+        if current >= trade_state["t1"] and not trade_state["t1_hit"]:
+            trade_state["t1_hit"] = True
+            trade_state["stop"] = entry + 0.25 * atr_v
+            log.info(f"T1 HIT — stop moved to ${trade_state['stop']:,.2f} (locked profit)")
+
+        if trade_state["t1_hit"]:
+            trail = trade_state["peak"] - 0.35 * atr_v
+            if trail > trade_state["stop"]:
+                trade_state["stop"] = trail
+                log.info(f"Trail updated: ${trail:,.2f} (peak: ${trade_state['peak']:,.2f})")
 
     else:
-        sl = entry + 1.2 * atr_v
-        t1 = entry - 0.6 * atr_v
-        t2 = entry - 1.5 * atr_v
+        trade_state["trough"] = min(trade_state.get("trough", entry), current)
 
-        if current >= sl:
-            log.warning(f"SL HIT — closing SHORT at ${current:,.2f} (SL: ${sl:,.2f})")
+        if current >= trade_state["stop"]:
+            pnl_type = "TRAIL_STOP" if trade_state["t1_hit"] else "SL_HIT"
+            log.warning(f"{pnl_type} — closing SHORT at ${current:,.2f} (stop: ${trade_state['stop']:,.2f})")
             client.close_position("BTC/USD")
-            return {"action": "SL_HIT", "pnl": unr_pnl, "price": current}
+            result = {"action": pnl_type, "pnl": unr_pnl, "price": current}
+            reset_trade_state()
+            return result
 
-        if current <= t2:
-            log.info(f"T2 HIT — closing SHORT at ${current:,.2f} (T2: ${t2:,.2f})")
+        if current <= trade_state["t2"]:
+            log.info(f"T2 HIT — closing SHORT at ${current:,.2f}")
             client.close_position("BTC/USD")
-            return {"action": "T2_HIT", "pnl": unr_pnl, "price": current}
+            result = {"action": "T2_HIT", "pnl": unr_pnl, "price": current}
+            reset_trade_state()
+            return result
 
-        if current <= t1:
-            trail_stop = current + 0.35 * atr_v
-            if trail_stop < entry - 0.25 * atr_v:
-                log.info(f"T1 hit, trailing. Current: ${current:,.2f}, Trail SL: ${trail_stop:,.2f}")
+        if current <= trade_state["t1"] and not trade_state["t1_hit"]:
+            trade_state["t1_hit"] = True
+            trade_state["stop"] = entry - 0.25 * atr_v
+            log.info(f"T1 HIT — stop moved to ${trade_state['stop']:,.2f} (locked profit)")
 
-    log.info(f"Position open: {side} {qty:.6f} BTC | Entry: ${entry:,.2f} | "
-             f"Current: ${current:,.2f} | P&L: ${unr_pnl:,.2f}")
+        if trade_state["t1_hit"]:
+            trail = trade_state["trough"] + 0.35 * atr_v
+            if trail < trade_state["stop"]:
+                trade_state["stop"] = trail
+                log.info(f"Trail updated: ${trail:,.2f} (trough: ${trade_state['trough']:,.2f})")
+
+    t1_lbl = "✅" if trade_state["t1_hit"] else "⏳"
+    log.info(f"  {side} {qty:.6f} BTC | Entry: ${entry:,.2f} | Now: ${current:,.2f} | "
+             f"P&L: ${unr_pnl:,.2f} | Stop: ${trade_state['stop']:,.2f} | T1:{t1_lbl}")
     return {"action": "HOLDING", "pnl": unr_pnl, "price": current}
 
 # ── Email Notification ────────────────────────────────────
@@ -345,12 +408,37 @@ def send_email(subject, body):
     except Exception as e:
         log.error(f"Email failed: {e}")
 
-# ── Main Loop ─────────────────────────────────────────────
+# ── Position Check (every minute) ─────────────────────────
 
-def run_scan(client, risk_pct):
-    """Single scan cycle: fetch data, check signal, manage position, place order."""
+def tick_position(client):
+    """Quick position check using Alpaca live price. No candle fetch needed."""
+    try:
+        result = manage_position(client)
+        if result and result["action"] in ("SL_HIT", "T2_HIT", "TRAIL_STOP"):
+            emoji = {"SL_HIT": "🛑", "T2_HIT": "🎯", "TRAIL_STOP": "🔒"}[result["action"]]
+            send_email(
+                f"{emoji} BTC Trade Closed — {result['action']}",
+                f"<h2>{result['action']}</h2>"
+                f"<p>Price: ${result['price']:,.2f}<br>"
+                f"P&L: ${result['pnl']:,.2f}</p>"
+            )
+            return result
+    except Exception as e:
+        log.error(f"Position check error: {e}")
+    return None
+
+# ── Signal Scan (every hour on candle close) ──────────────
+
+def scan_for_signal(client, risk_pct):
+    """Fetch 1h candles, run V3 detection, place order if signal found."""
     log.info("=" * 60)
-    log.info("Scanning BTC/USD for V3 signal…")
+    log.info("HOURLY SCAN — checking for V3 entry signal…")
+
+    positions = client.get_all_positions()
+    has_btc = any(p.symbol in ("BTC/USD", "BTCUSD") for p in positions)
+    if has_btc:
+        log.info("Already in a position — skipping signal scan.")
+        return
 
     try:
         df = fetch_candles("BTCUSDT", "1h", 1000)
@@ -361,23 +449,6 @@ def run_scan(client, risk_pct):
     log.info(f"Fetched {len(df)} candles — "
              f"{df.index[0].strftime('%Y-%m-%d %H:%M')} → "
              f"{df.index[-1].strftime('%Y-%m-%d %H:%M')}")
-
-    exit_result = manage_position(client, df)
-    if exit_result and exit_result["action"] in ("SL_HIT", "T2_HIT"):
-        emoji = "🛑" if "SL" in exit_result["action"] else "🎯"
-        send_email(
-            f"{emoji} BTC Trade Closed — {exit_result['action']}",
-            f"<h2>{exit_result['action']}</h2>"
-            f"<p>Price: ${exit_result['price']:,.2f}<br>"
-            f"P&L: ${exit_result['pnl']:,.2f}</p>"
-        )
-
-    positions = client.get_all_positions()
-    has_btc = any(p.symbol in ("BTC/USD", "BTCUSD") for p in positions)
-
-    if has_btc:
-        log.info("Already in a BTC position — skipping signal check.")
-        return
 
     signal = detect_v3_signal(df)
 
@@ -399,17 +470,19 @@ def run_scan(client, risk_pct):
         qty_btc = round(risk_amt / sl_dist, 6)
         qty_btc = max(qty_btc, 0.0001)
 
-        side = OrderSide.BUY if signal["side"] == "BUY" else OrderSide.SELL
-        order = client.submit_order(MarketOrderRequest(
+        order_side = OrderSide.BUY if signal["side"] == "BUY" else OrderSide.SELL
+        client.submit_order(MarketOrderRequest(
             symbol="BTC/USD",
             qty=qty_btc,
-            side=side,
+            side=order_side,
             time_in_force=TimeInForce.GTC,
         ))
 
+        alpaca_side = "LONG" if signal["side"] == "BUY" else "SHORT"
+        init_trade_state(signal["price"], signal["atr"], alpaca_side)
+
         log.info(f"✅ ORDER PLACED: {signal['side']} {qty_btc:.6f} BTC")
-        log.info(f"   Stop Loss: ${signal['stop']:,.2f}")
-        log.info(f"   T1: ${signal['t1']:,.2f} | T2: ${signal['t2']:,.2f}")
+        log.info(f"   Stop: ${trade_state['stop']:,.2f} | T1: ${trade_state['t1']:,.2f} | T2: ${trade_state['t2']:,.2f}")
 
         send_email(
             f"🎯 BTC {signal['side']} Order Placed — V3 Sniper",
@@ -432,12 +505,11 @@ def run_scan(client, risk_pct):
         log.error(f"Order failed: {e}")
         send_email("❌ BTC Order Failed", f"<p>Error: {e}</p>")
 
+# ── Main Loop ─────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="V3 BTC Sniper — Alpaca Auto Trader")
     parser.add_argument("--loop", action="store_true", help="Run continuously")
-    parser.add_argument("--interval", type=int, default=3600,
-                        help="Seconds between scans (default 3600 = 1 hour)")
     args = parser.parse_args()
 
     api_key = os.getenv("ALPACA_API_KEY")
@@ -452,7 +524,7 @@ def main():
 
     try:
         acct = client.get_account()
-        log.info(f"Connected to Alpaca Paper Trading")
+        log.info("Connected to Alpaca Paper Trading")
         log.info(f"  Equity: ${float(acct.equity):,.2f}")
         log.info(f"  Cash: ${float(acct.cash):,.2f}")
         log.info(f"  Risk per trade: {risk_pct}%")
@@ -460,14 +532,30 @@ def main():
         log.error(f"Alpaca connection failed: {e}")
         sys.exit(1)
 
-    if args.loop:
-        log.info(f"Starting continuous scan — every {args.interval}s ({args.interval//60} min)")
-        while True:
-            run_scan(client, risk_pct)
-            log.info(f"Next scan in {args.interval//60} minutes…")
-            time.sleep(args.interval)
-    else:
-        run_scan(client, risk_pct)
+    if not args.loop:
+        tick_position(client)
+        scan_for_signal(client, risk_pct)
+        return
+
+    TICK_INTERVAL = 60
+    SIGNAL_INTERVAL = 3600
+    last_signal_scan = 0
+
+    log.info("Starting auto-trader:")
+    log.info("  Position check: every 60 seconds")
+    log.info("  Signal scan: every 1 hour (on candle close)")
+    log.info("-" * 60)
+
+    while True:
+        now = time.time()
+
+        tick_position(client)
+
+        if now - last_signal_scan >= SIGNAL_INTERVAL:
+            scan_for_signal(client, risk_pct)
+            last_signal_scan = now
+
+        time.sleep(TICK_INTERVAL)
 
 
 if __name__ == "__main__":

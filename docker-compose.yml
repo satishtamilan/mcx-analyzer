@@ -22,7 +22,7 @@ services:
   # Alpaca auto-trader — V3 BTC Sniper, scans every hour
   alpaca_trader:
     build: .
-    entrypoint: ["python", "alpaca_trader.py", "--loop", "--interval", "3600"]
+    entrypoint: ["python", "alpaca_trader.py", "--loop"]
     environment:
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
