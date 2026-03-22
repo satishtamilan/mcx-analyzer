@@ -1,0 +1,32 @@
+name: BTC V3 Sniper — Alpaca Auto Trader
+
+on:
+  schedule:
+    - cron: '5 * * * *'  # Runs 5 minutes past every hour (after candle close)
+  workflow_dispatch:       # allows manual trigger from GitHub UI
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy alpaca-py
+
+      - name: Run V3 Sniper trader
+        env:
+          ALPACA_API_KEY:    ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          RISK_PCT:          ${{ vars.RISK_PCT || '2' }}
+          SENDER_EMAIL:      ${{ secrets.SENDER_EMAIL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL:   ${{ secrets.RECIPIENT_EMAIL }}
+        run: python alpaca_trader.py

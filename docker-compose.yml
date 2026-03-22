@@ -18,3 +18,16 @@ services:
       - TIMEFRAME=${TIMEFRAME:-15m}
       - MIN_SCORE=${MIN_SCORE:-5}
     restart: unless-stopped
+
+  # Alpaca auto-trader — V3 BTC Sniper, scans every hour
+  alpaca_trader:
+    build: .
+    entrypoint: ["python", "alpaca_trader.py", "--loop", "--interval", "3600"]
+    environment:
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      - RISK_PCT=${RISK_PCT:-2}
+      - SENDER_EMAIL=${SENDER_EMAIL}
+      - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD}
+      - RECIPIENT_EMAIL=${RECIPIENT_EMAIL}
+    restart: unless-stopped
